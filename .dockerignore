@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+venv/
+.venv/
+env/
+
+# Node
+frontend/node_modules/
+
+# Data（运行时持久化，不打包进镜像）
+data/
+logs/*.log
+
+# Environment（密钥不打包进镜像）
+.env
+*.env.local
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Docker
+.docker/

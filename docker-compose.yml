@@ -1,0 +1,51 @@
+# ============================================================================
+# 企业知识库问答系统 - Docker Compose
+#
+# 一键部署:
+#   1. 复制 .env.example 为 .env（如未配置）
+#   2. docker compose up --build
+#
+# 数据持久化:
+#   - chroma_db   → 向量数据库（知识库内容）
+#   - documents   → 上传/导入的原始文档
+#   - logs        → 应用日志
+# ============================================================================
+
+services:
+
+  # -----------------------------------------------------------------------
+  # 后端 + 前端（单容器，FastAPI 托管 React 静态文件）
+  # -----------------------------------------------------------------------
+  app:
+    build: .
+    container_name: enterprise-kb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # 持久化数据目录（容器重建不丢数据）
+      - ./data/chroma_db:/app/data/chroma_db
+      - ./data/documents:/app/data/documents
+      - ./data/processed:/app/data/processed
+      - ./logs:/app/logs
+    environment:
+      # 确保容器内向量数据库路径指向挂载目录
+      - VECTOR_DB_PATH=/app/data/chroma_db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+# ============================================================================
+# 数据卷（Docker Desktop for Windows: 使用 named volume 性能更好）
+# 如果你想用 named volume 替代 bind mount，取消下面注释即可:
+#
+#   volumes:
+#     chroma_db:
+#     documents:
+#     processed:
+# ============================================================================
