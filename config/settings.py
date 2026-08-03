@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # ================================================================
     # 阿里云百炼 API 配置
     # ================================================================
-    BAILIAN_API_KEY: str = "sk-4c889e3be9bf4b988005f7de49041851"
+    BAILIAN_API_KEY: str = ""  # 从 .env 加载
     """阿里云百炼 API 密钥"""
 
     BAILIAN_API_BASE: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     # ================================================================
     # 数据库配置（PostgreSQL + pgvector）
     # ================================================================
+    VECTOR_STORE_TYPE: str = "pg"
+    """向量存储后端类型: pg（PostgreSQL+pgvector）| chroma（ChromaDB）"""
+
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/knowledge_base"
     """PostgreSQL 连接字符串（用于替代 ChromaDB/SQLite）"""
 
@@ -181,3 +184,13 @@ settings = Settings()
 # 确保必要目录存在
 settings.DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 settings.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+# ==============================================================================
+# 启动校验：确保 API Key 已配置
+# ==============================================================================
+if not settings.BAILIAN_API_KEY:
+    raise RuntimeError(
+        'BAILIAN_API_KEY 未配置。请在 .env 文件中设置:\n'
+        '  BAILIAN_API_KEY=sk-xxxxxxxxxxxxxxxxxxxx\n'
+        '详见 .env.example 模板。'
+    )

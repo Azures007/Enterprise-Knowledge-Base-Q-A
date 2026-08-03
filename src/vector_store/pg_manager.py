@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 from config.settings import settings
 from src.utils.logger import setup_logger
@@ -40,6 +41,29 @@ logger = setup_logger(__name__)
 class PGVectorStoreError(Exception):
     """PostgreSQL 向量存储异常"""
     pass
+
+
+class _PooledConnection:
+    """
+    连接池连接包装器。
+
+    在退出 with 代码块时自动将连接归还连接池，
+    保持原有 `with self._get_conn() as conn:` 调用方式不变。
+    """
+
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._pool.putconn(self._conn)
+        return False
 
 
 class PGVectorStore:
@@ -81,10 +105,24 @@ class PGVectorStore:
     # ================================================================
 
     def _get_conn(self):
-        """获取数据库连接"""
-        conn = psycopg2.connect(self.conn_string)
-        conn.autocommit = True
-        return conn
+        """
+        从连接池获取数据库连接。
+
+        返回的 _PooledConnection 支持 with 语法，退出时自动归还连接池。
+        """
+        if not hasattr(self, "_pool"):
+            self._pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,
+                dsn=self.conn_string,
+            )
+            logger.info(f"数据库连接池已创建 (min=1, max=20)")
+        try:
+            conn = self._pool.getconn()
+            conn.autocommit = True
+            return _PooledConnection(self._pool, conn)
+        except psycopg2.pool.PoolError as e:
+            raise PGVectorStoreError(f"获取数据库连接失败（连接池已耗尽）: {e}") from e
 
     def _init_db(self):
         """创建所有必要的表和扩展"""
@@ -170,6 +208,24 @@ class PGVectorStore:
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_messages_conversation
                     ON messages(conversation_id, created_at)
+                """)
+
+                # 导入审计日志表
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS ingest_audit_log (
+                        id          SERIAL PRIMARY KEY,
+                        collection  VARCHAR(255),
+                        filename    VARCHAR(255),
+                        action      VARCHAR(20),
+                        doc_id      INTEGER,
+                        old_doc_id  INTEGER,
+                        old_content_hash VARCHAR(64),
+                        chunks_added INTEGER,
+                        file_size   INTEGER,
+                        status      VARCHAR(20),
+                        error_msg   TEXT,
+                        created_at  TIMESTAMP DEFAULT NOW()
+                    )
                 """)
 
         logger.info("PostgreSQL 数据库表初始化完成")
@@ -271,6 +327,13 @@ class PGVectorStore:
                     added_count += len(values)
                     logger.debug(f"已添加 {added_count}/{len(texts)} 个文档块")
 
+        self.log_audit(
+            action="ingest",
+            filename=metadatas[0].get("filename", "unknown") if metadatas else "unknown",
+            status="success",
+            doc_id=document_id,
+            chunks_added=added_count,
+        )
         logger.info(f"文档入库完成: 共 {added_count} 个文档块")
         return added_count
 
@@ -299,6 +362,52 @@ class PGVectorStore:
                 doc_id = cur.fetchone()[0]
         logger.info(f"文档记录已创建: {filename} (id={doc_id})")
         return doc_id
+
+    def log_audit(
+        self,
+        action: str,
+        filename: str,
+        status: str = "success",
+        error_msg: str | None = None,
+        **kwargs: Any,
+    ):
+        """
+        记录导入/删除操作的审计日志。
+
+        Args:
+            action:    "ingest" / "delete"
+            filename:  文件名
+            status:    "success" / "error" / "overwrite"
+            error_msg: 错误信息（可选）
+            **kwargs:  额外字段 (doc_id, old_doc_id, old_content_hash, chunks_added, file_size)
+        """
+        try:
+            with self._get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO ingest_audit_log
+                        (collection, filename, action, doc_id, old_doc_id,
+                         old_content_hash, chunks_added, file_size, status, error_msg)
+                        VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            self.collection_name,
+                            filename,
+                            action,
+                            kwargs.get("doc_id"),
+                            kwargs.get("old_doc_id"),
+                            kwargs.get("old_content_hash"),
+                            kwargs.get("chunks_added"),
+                            kwargs.get("file_size"),
+                            status,
+                            error_msg,
+                        ),
+                    )
+            logger.debug(f"审计日志已记录: {action} {filename} [{status}]")
+        except Exception as e:
+            logger.warning(f"审计日志记录失败: {e}")
 
     def find_document_by_hash(self, content_hash: str) -> dict | None:
         """
@@ -469,6 +578,14 @@ class PGVectorStore:
                 deleted_chunks = deleted_by_id + deleted_by_name
                 cur.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
 
+        self.log_audit(
+            action="delete",
+            filename=doc_info["filename"],
+            status="success",
+            doc_id=doc_id,
+            old_content_hash=doc_info.get("content_hash"),
+            file_size=doc_info.get("file_size"),
+        )
         logger.info(
             f"文档已删除: {doc_info['filename']} (id={doc_id}, "
             f"chunks={deleted_chunks})"

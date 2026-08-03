@@ -116,16 +116,37 @@ class RAGPipeline:
         Args:
             embedder:      嵌入模型实例（默认新建）
             llm:           LLM 实例（默认新建）
-            vector_store:  向量存储实例（默认新建）
+            vector_store:  向量存储实例（默认新建，根据 settings.VECTOR_STORE_TYPE 自动选择后端）
         """
         self.embedder = embedder or BailianEmbeddings()
         self.llm = llm or BailianLLM()
-        self.vector_store = vector_store or VectorStoreManager(self.embedder)
+        self.vector_store = vector_store or self._create_default_vector_store()
 
         self._total_queries = 0
         self._total_tokens_estimate = 0
 
-        logger.info("RAG 混合管线初始化完成")
+        store_type = getattr(settings, 'VECTOR_STORE_TYPE', 'pg')
+        logger.info(f"RAG 混合管线初始化完成（向量后端: {store_type}）")
+
+    @staticmethod
+    def _create_default_vector_store():
+        """根据 settings.VECTOR_STORE_TYPE 创建默认向量存储后端"""
+        store_type = getattr(settings, 'VECTOR_STORE_TYPE', 'pg').lower()
+
+        if store_type == 'pg':
+            from src.vector_store import PGVectorStore
+            logger.info("自动选择向量存储后端: PostgreSQL + pgvector")
+            try:
+                return PGVectorStore(BailianEmbeddings())
+            except ImportError as e:
+                raise RAGPipelineError(
+                    f"使用 pg 向量存储需要安装 PostgreSQL 驱动: {e}\n"
+                    f"请执行: pip install psycopg2-binary\n"
+                    f"或者在 .env 中设置 VECTOR_STORE_TYPE=chroma 以使用 ChromaDB"
+                ) from e
+        else:
+            logger.info("自动选择向量存储后端: ChromaDB")
+            return VectorStoreManager(BailianEmbeddings())
 
     # ================================================================
     # 核心问答接口
@@ -285,12 +306,13 @@ class RAGPipeline:
                 logger.info(
                     f"回答生成完成（模式: {answer_type}, 长度={len(answer)}字）"
                 )
-                # 保存到缓存（非流式）
+                # 保存到缓存（非流式），按来源文件打标签以便精准失效
+                cache_tags = [f"doc:{s.get('filename', '')}" for s in sources if s.get("filename")]
                 qa_cache.set(question, {
                     "answer": answer,
                     "sources": sources,
                     "answer_type": answer_type,
-                })
+                }, tags=cache_tags)
                 return {
                     "answer": answer,
                     "sources": sources,
@@ -326,11 +348,26 @@ class RAGPipeline:
     # ================================================================
 
     def add_documents(self, documents: list[dict[str, Any]], document_id: int | None = None) -> int:
-        """向知识库中添加文档（自动清除问答缓存）。"""
+        """
+        向知识库中添加文档。
+
+        仅使引用了这些文档来源的问答缓存失效，而非清空全部缓存。
+        """
         result = self.vector_store.add_documents(documents, document_id=document_id)
         if result > 0:
-            qa_cache.clear()
-            logger.info("知识库已更新，问答缓存已清空")
+            # 按来源文件名精确失效缓存
+            affected_tags = []
+            for doc in documents:
+                filename = doc.get("metadata", {}).get("filename")
+                if filename:
+                    affected_tags.append(f"doc:{filename}")
+            if affected_tags:
+                qa_cache.invalidate_by_tags(affected_tags)
+                logger.info(f"知识库已更新，已按来源文件失效 {len(affected_tags)} 个标签的缓存")
+            else:
+                # 文档没有文件名信息时，无法精确定位，只能全量清空（兜底）
+                qa_cache.clear()
+                logger.info("知识库已更新，问答缓存已清空（无文件名信息）")
         return result
 
     def get_knowledge_base_stats(self) -> dict[str, Any]:

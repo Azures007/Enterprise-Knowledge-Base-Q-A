@@ -30,18 +30,33 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
-    Request,
     UploadFile,
 )
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from src.document_loader import DocumentLoader
-from src.embeddings import BailianEmbeddings
-from src.llm import BailianLLM
 from src.rag import RAGPipeline
 from src.text_processor import TextChunker
 from src.utils.logger import setup_logger
 from config.settings import settings
+
+from src.conversations import ConversationManager, PGConversationManager
+
+from .models import (
+    AddMessageRequest,
+    APIResponse,
+    BatchDeleteConversationsRequest,
+    CreateCollectionRequest,
+    IngestConfirmRequest,
+    QueryRequest,
+    QueryResponseData,
+    QueryStats,
+    RenameCollectionRequest,
+    SourceInfo,
+    StreamQueryRequest,
+    UpdateConversationTitleRequest,
+    UpdateMessageRequest,
+)
 
 logger = setup_logger(__name__)
 
@@ -59,15 +74,7 @@ def get_rag_pipeline() -> RAGPipeline:
     """获取或创建 RAG 管线单例"""
     global _rag_pipeline
     if _rag_pipeline is None:
-        embedder = BailianEmbeddings()
-        llm = BailianLLM()
-        from src.vector_store import PGVectorStore
-        vector_store = PGVectorStore(embedder)
-        _rag_pipeline = RAGPipeline(
-            embedder=embedder,
-            llm=llm,
-            vector_store=vector_store,
-        )
+        _rag_pipeline = RAGPipeline()
     return _rag_pipeline
 
 
@@ -88,13 +95,16 @@ def get_text_chunker() -> TextChunker:
 
 
 def get_conversation_mgr() -> PGConversationManager:
-    """获取对话管理器单例（复用 RAG 管线的 PGVectorStore）"""
+    """获取对话管理器单例（优先复用 RAG 管线的 PGVectorStore）"""
     global _conversation_mgr
     if _conversation_mgr is None:
         from src.conversations import PGConversationManager
-        # 复用 RAG 管线中的 PGVectorStore，避免重复创建导致集合重建
         rag = get_rag_pipeline()
-        _conversation_mgr = PGConversationManager(vector_store=rag.vector_store)
+        # 仅当 RAG 管线使用 PGVectorStore 时复用，否则创建独立实例
+        if hasattr(rag.vector_store, "add_message"):
+            _conversation_mgr = PGConversationManager(vector_store=rag.vector_store)
+        else:
+            _conversation_mgr = PGConversationManager()
     return _conversation_mgr
 
 
@@ -170,54 +180,38 @@ async def health_check():
 # 知识库问答
 # ---------------------------------------------------------------
 
-@router.post("/query", summary="知识库问答")
+@router.post("/query", summary="知识库问答", response_model=APIResponse)
 async def query_knowledge_base(
-    request: Request,
+    body: QueryRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
 ):
     """
     向知识库提问并获取回答。
 
-    请求体格式 (JSON):
-        {
-            "question": "公司考勤制度是什么？",
-            "k": 5,
-            "concise": false,
-            "collection": null
-        }
-
     collection: 可选，指定查询的集合名称。不传则自动路由到最相关的集合。
     """
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体必须是有效的 JSON")
-
-    question = body.get("question", "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="问题不能为空")
-
-    k = body.get("k")
-    concise = body.get("concise", False)
-    filter_criteria = body.get("filter")
-    collection_name = body.get("collection")
+    question = body.question.strip()
+    k = body.k
+    concise = body.concise
+    filter_criteria = body.filter
+    collection_name = body.collection
 
     # ---- 自动路由：确定查询哪个集合 ----
     all_collections = rag.vector_store.list_collections()
     if not all_collections:
         # 没有集合，直接返回空
-        return {
-            "code": 0,
-            "message": "success",
-            "data": {
-                "question": question,
-                "answer": "当前知识库为空，请先上传文档。",
-                "sources": [],
-                "answer_type": "general",
-                "collection": None,
-                "stats": {"retrieved_chunks": 0, "unique_sources": 0},
-            },
-        }
+        return APIResponse(
+            code=0,
+            message="success",
+            data=QueryResponseData(
+                question=question,
+                answer="当前知识库为空，请先上传文档。",
+                sources=[],
+                answer_type="general",
+                collection=None,
+                stats=QueryStats(retrieved_chunks=0, unique_sources=0),
+            ),
+        )
 
     if collection_name and collection_name in all_collections:
         # 用户指定了集合
@@ -232,18 +226,18 @@ async def query_knowledge_base(
     if target_collection is None:
         # 自动路由无法确定，提示用户手动选择
         coll_list = "、".join(all_collections)
-        return {
-            "code": 0,
-            "message": "success",
-            "data": {
-                "question": question,
-                "answer": f"无法确定您的问题属于哪个知识库。当前可用的集合有：{coll_list}。请手动选择对应的集合后重新提问。",
-                "sources": [],
-                "answer_type": "routing_failed",
-                "collection": None,
-                "stats": {"retrieved_chunks": 0, "unique_sources": 0},
-            },
-        }
+        return APIResponse(
+            code=0,
+            message="success",
+            data=QueryResponseData(
+                question=question,
+                answer=f"无法确定您的问题属于哪个知识库。当前可用的集合有：{coll_list}。请手动选择对应的集合后重新提问。",
+                sources=[],
+                answer_type="routing_failed",
+                collection=None,
+                stats=QueryStats(retrieved_chunks=0, unique_sources=0),
+            ),
+        )
 
     # 切换到目标集合
     rag.vector_store.switch_collection(target_collection)
@@ -256,21 +250,21 @@ async def query_knowledge_base(
             concise=concise,
             filter_criteria=filter_criteria,
         )
-        return {
-            "code": 0,
-            "message": "success",
-            "data": {
-                "question": question,
-                "answer": result["answer"],
-                "sources": result["sources"],
-                "answer_type": result.get("answer_type", "general"),
-                "collection": target_collection,
-                "stats": {
-                    "retrieved_chunks": len(result["context"]),
-                    "unique_sources": len(result["sources"]),
-                },
-            },
-        }
+        return APIResponse(
+            code=0,
+            message="success",
+            data=QueryResponseData(
+                question=question,
+                answer=result["answer"],
+                sources=[SourceInfo(**s) for s in result["sources"]],
+                answer_type=result.get("answer_type", "general"),
+                collection=target_collection,
+                stats=QueryStats(
+                    retrieved_chunks=len(result["context"]),
+                    unique_sources=len(result["sources"]),
+                ),
+            ),
+        )
     except Exception as e:
         logger.error(f"问答接口异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"问答服务异常: {e}")
@@ -282,31 +276,16 @@ async def query_knowledge_base(
 
 @router.post("/query/stream", summary="流式知识库问答（SSE）")
 async def query_knowledge_base_stream(
-    request: Request,
+    body: StreamQueryRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
 ):
     """
     流式知识库问答，使用 Server-Sent Events (SSE) 协议。
-
-    请求体格式 (JSON):
-        {
-            "question": "公司考勤制度是什么？",
-            "k": 5,
-            "concise": false
-        }
     """
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体必须是有效的 JSON")
-
-    question = body.get("question", "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="问题不能为空")
-
-    k = body.get("k")
-    concise = body.get("concise", False)
-    collection_name = body.get("collection")
+    question = body.question.strip()
+    k = body.k
+    concise = body.concise
+    collection_name = body.collection
 
     # ---- 自动路由：确定查询哪个集合 ----
     all_collections = rag.vector_store.list_collections()
@@ -414,32 +393,17 @@ async def get_upload_token(
 
 @router.post("/ingest/confirm", summary="确认 OSS 直传并导入文档")
 async def confirm_upload(
-    request: Request,
+    body: IngestConfirmRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
     loader: DocumentLoader = Depends(get_document_loader),
     chunker: TextChunker = Depends(get_text_chunker),
 ):
     """
     确认 OSS 直传完成，从 OSS 下载文件并导入知识库。
-
-    请求体格式 (JSON):
-        {
-            "object_key": "knowledge_base_files/abc123.pdf",
-            "filename": "考勤制度.pdf",
-            "collection": "人事制度"
-        }
     """
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体必须是有效的 JSON")
-
-    object_key = body.get("object_key", "").strip()
-    filename = body.get("filename", "").strip() or object_key.split("/")[-1]
-    collection_name = body.get("collection")
-
-    if not object_key:
-        raise HTTPException(status_code=400, detail="object_key 不能为空")
+    object_key = body.object_key.strip()
+    filename = (body.filename or "").strip() or object_key.split("/")[-1]
+    collection_name = body.collection
 
     # 切换到目标集合
     if collection_name:
@@ -678,12 +642,16 @@ async def ingest_document(
             existing_name = None
 
         if existing_name is not None:
-            os.unlink(tmp_path)
-            raise HTTPException(status_code=409, detail={
-                "error_type": "duplicate_filename",
-                "message": f"文件名 '{final_filename}' 已存在",
-                "suggestion": f"该文件名已在 {existing_name['created_at'][:10]} 导入过。请使用不同的文件名上传。",
-            })
+            logger.info(f"文件名 '{final_filename}' 已存在，执行覆盖更新 (旧文档 id={existing_name['id']})")
+            old_doc_id = existing_name["id"]
+            try:
+                rag.vector_store.delete_document(old_doc_id, delete_storage=True)
+                logger.info(f"旧文档已删除 (id={old_doc_id})")
+            except Exception as e:
+                logger.warning(f"删除旧文档失败（继续导入）: {e}")
+            from src.cache import qa_cache
+            qa_cache.invalidate_by_tags([f"doc:{final_filename}"])
+            logger.info(f"已清除旧文档缓存: {final_filename}")
 
         # 解析文档
         raw_docs = loader.load_file(tmp_path)
@@ -835,9 +803,12 @@ async def delete_document(
         if result is None:
             raise HTTPException(status_code=404, detail="文档不存在")
 
-        # 清空问答缓存
+        # 按被删除文档的文件名精确失效相关缓存
         from src.cache import qa_cache
-        qa_cache.clear()
+        if result.get("filename"):
+            qa_cache.invalidate_by_tags([f"doc:{result['filename']}"])
+        else:
+            qa_cache.clear()
 
         return {
             "code": 0,
@@ -899,18 +870,11 @@ async def list_collections(
 
 @router.post("/collections", summary="创建新集合")
 async def create_collection(
-    request: Request,
+    body: CreateCollectionRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
 ):
     """创建新的知识库集合"""
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体必须是有效的 JSON")
-
-    name = body.get("name", "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="集合名称不能为空")
+    name = body.name.strip()
 
     if name in rag.vector_store.list_collections():
         raise HTTPException(status_code=409, detail=f"集合 '{name}' 已存在")
@@ -930,18 +894,11 @@ async def create_collection(
 @router.put("/collections/{collection_name}", summary="重命名集合")
 async def rename_collection(
     collection_name: str,
-    request: Request,
+    body: RenameCollectionRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
 ):
     """重命名指定集合"""
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体必须是有效的 JSON")
-
-    new_name = body.get("name", "").strip()
-    if not new_name:
-        raise HTTPException(status_code=400, detail="新名称不能为空")
+    new_name = body.name.strip()
 
     if new_name in rag.vector_store.list_collections():
         raise HTTPException(status_code=409, detail=f"集合 '{new_name}' 已存在")
@@ -1055,18 +1012,13 @@ async def create_conversation(
 
 @router.delete("/conversations", summary="批量删除对话")
 async def batch_delete_conversations(
-    request: Request,
+    body: BatchDeleteConversationsRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
 ):
     """批量删除指定对话（含所有消息）"""
     try:
-        body = await request.json()
-        ids = body.get("ids", [])
-        if not ids or not isinstance(ids, list):
-            raise HTTPException(status_code=400, detail="请提供要删除的对话 ID 列表")
-
         deleted = 0
-        for conv_id in ids:
+        for conv_id in body.ids:
             if mgr.delete_conversation(conv_id):
                 deleted += 1
 
@@ -1097,16 +1049,12 @@ async def delete_conversation(
 @router.put("/conversations/{conv_id}/title", summary="修改对话标题")
 async def update_conversation_title(
     conv_id: int,
-    request: Request,
+    body: UpdateConversationTitleRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
 ):
     """修改对话标题"""
     try:
-        body = await request.json()
-        title = body.get("title", "").strip()
-        if not title:
-            raise HTTPException(status_code=400, detail="标题不能为空")
-        ok = mgr.update_title(conv_id, title)
+        ok = mgr.update_title(conv_id, body.title.strip())
         if not ok:
             raise HTTPException(status_code=404, detail="对话不存在")
         return {"code": 0, "message": "success", "data": {}}
@@ -1132,21 +1080,18 @@ async def get_messages(
 @router.post("/conversations/{conv_id}/messages", summary="添加消息到对话")
 async def add_message(
     conv_id: int,
-    request: Request,
+    body: AddMessageRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
 ):
     """向对话中添加一条消息"""
     try:
-        body = await request.json()
-        role = body.get("role", "user")
-        content = body.get("content", "")
-        sources = body.get("sources")
-        answer_type = body.get("answer_type")
-
-        if not content:
-            raise HTTPException(status_code=400, detail="消息内容不能为空")
-
-        msg_id = mgr.add_message(conv_id, role, content, sources, answer_type)
+        msg_id = mgr.add_message(
+            conv_id,
+            body.role,
+            body.content,
+            body.sources,
+            body.answer_type,
+        )
         return {"code": 0, "message": "success", "data": {"id": msg_id}}
     except HTTPException:
         raise
@@ -1158,15 +1103,12 @@ async def add_message(
 async def update_message(
     conv_id: int,
     msg_id: int,
-    request: Request,
+    body: UpdateMessageRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
 ):
     """更新消息内容（用于流式完成后补充完整内容和来源）"""
     try:
-        body = await request.json()
-        content = body.get("content", "")
-        sources = body.get("sources")
-        ok = mgr.update_message_content(msg_id, content, sources)
+        ok = mgr.update_message_content(msg_id, body.content, body.sources)
         if not ok:
             raise HTTPException(status_code=404, detail="消息不存在")
         return {"code": 0, "message": "success", "data": {}}

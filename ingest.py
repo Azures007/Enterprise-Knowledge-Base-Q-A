@@ -36,7 +36,6 @@ from src.embeddings import BailianEmbeddings
 from src.rag import RAGPipeline
 from src.text_processor import TextChunker
 from src.utils.logger import setup_logger
-from src.vector_store import VectorStoreManager
 
 logger = setup_logger(__name__)
 
@@ -216,11 +215,8 @@ def main():
     try:
         embedder = BailianEmbeddings()
         llm = None  # 导入时不需要 LLM
-        vector_store = VectorStoreManager(embedder)
-        rag = RAGPipeline(embedder=embedder, llm=None, vector_store=vector_store)
-        # 兼容处理：RAGPipeline 需要 llm，但导入时用不到
-        import src.llm.bailian_llm as bllm
-        rag.llm = bllm.BailianLLM()
+        vector_store = None  # 不指定则 RAGPipeline 根据配置自动选择
+        rag = RAGPipeline(embedder=embedder, llm=BailianLLM(), vector_store=vector_store)
 
         loader = DocumentLoader()
         chunker = TextChunker()

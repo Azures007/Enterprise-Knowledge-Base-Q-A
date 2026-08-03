@@ -518,9 +518,11 @@ class DocumentLoader:
         try:
             text = ocr_image(str(path))
         except ImportError as e:
-            raise DocumentLoaderError(str(e))
+            logger.warning(f"OCR 引擎未安装，图片跳过: {path.name} ({e})")
+            return []
         except Exception as e:
-            raise DocumentLoaderError(f"图片 OCR 识别失败: {e}")
+            logger.warning(f"图片 OCR 识别失败，跳过: {path.name} ({e})")
+            return []
         if not text.strip():
             logger.warning(f"图片 OCR 未识别到文字: {path.name}")
             return []
