@@ -225,6 +225,7 @@ class RAGPipeline:
                     "answer_type": cached.get("answer_type", "general"),
                     "stream": False,
                     "from_cache": True,
+                    "usage": {},  # 缓存命中无 LLM 调用
                 }
 
         # ---- 第 0.5 步：多轮问题重写（有历史时） ----
@@ -244,12 +245,14 @@ class RAGPipeline:
 
         # ---- 第 3 步：LLM 生成 ----
         logger.info(f"正在生成回答（模式: {prepared['answer_type']}）...")
+        usage_holder: dict = {}
         try:
             if stream:
                 answer_generator = self.llm.stream(
                     prompt=question,
                     system_prompt=prepared["system_prompt"],
                     history=history,
+                    usage_cb=lambda u: usage_holder.update(u),
                 )
                 return {
                     "answer": answer_generator,
@@ -257,12 +260,14 @@ class RAGPipeline:
                     "context": prepared["retrieved_docs"],
                     "answer_type": prepared["answer_type"],
                     "stream": True,
+                    "usage": usage_holder,
                 }
             else:
                 answer = self.llm.generate(
                     prompt=question,
                     system_prompt=prepared["system_prompt"],
                     history=history,
+                    usage_cb=lambda u: usage_holder.update(u),
                 )
                 logger.info(
                     f"回答生成完成（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
@@ -289,6 +294,7 @@ class RAGPipeline:
                     "answer_type": prepared["answer_type"],
                     "stream": False,
                     "from_cache": False,
+                    "usage": usage_holder,
                     "related_questions": related,
                 }
 
@@ -332,6 +338,7 @@ class RAGPipeline:
                     "answer_type": cached.get("answer_type", "general"),
                     "stream": False,
                     "from_cache": True,
+                    "usage": {},  # 缓存命中无 LLM 调用
                 }
 
         # ---- 第 0.5 步：多轮问题重写（有历史时，结合上下文把问题改写成独立完整问题） ----
@@ -352,12 +359,14 @@ class RAGPipeline:
 
         # ---- 第 3 步：LLM 生成（异步） ----
         logger.info(f"正在生成回答(异步)（模式: {prepared['answer_type']}）...")
+        usage_holder: dict = {}
         try:
             if stream:
                 answer_generator = self.llm.astream(
                     prompt=question,
                     system_prompt=prepared["system_prompt"],
                     history=history,
+                    usage_cb=lambda u: usage_holder.update(u),
                 )
                 return {
                     "answer": answer_generator,
@@ -365,12 +374,14 @@ class RAGPipeline:
                     "context": prepared["retrieved_docs"],
                     "answer_type": prepared["answer_type"],
                     "stream": True,
+                    "usage": usage_holder,
                 }
             else:
                 answer = await self.llm.agenerate(
                     prompt=question,
                     system_prompt=prepared["system_prompt"],
                     history=history,
+                    usage_cb=lambda u: usage_holder.update(u),
                 )
                 logger.info(
                     f"回答生成完成(异步)（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
@@ -396,6 +407,7 @@ class RAGPipeline:
                     "answer_type": prepared["answer_type"],
                     "stream": False,
                     "from_cache": False,
+                    "usage": usage_holder,
                     "related_questions": related,
                 }
 

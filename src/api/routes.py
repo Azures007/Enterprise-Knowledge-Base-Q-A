@@ -24,6 +24,7 @@ API 路由模块
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,7 @@ from .models import (
     IngestConfirmRequest,
     LoginRequest,
     LoginResponseData,
+    MessageFeedbackRequest,
     QueryRequest,
     QueryResponseData,
     QueryStats,
@@ -254,6 +256,56 @@ async def _resolve_upload_collection(rag, auth: dict, requested: str | None) -> 
         return requested
     logger.info(f"用户 {username} 尝试上传到无权集合 '{requested}'，回退个人集合 '{personal}'")
     return personal
+
+
+async def _log_query_audit(
+    rag,
+    *,
+    username: str,
+    question: str,
+    answer: str = "",
+    answer_type: str = "",
+    collection: str | None = None,
+    sources: list | None = None,
+    conversation_id: int | None = None,
+    k: int | None = None,
+    concise: bool = False,
+    from_cache: bool = False,
+    latency_ms: int | None = None,
+    usage: dict | None = None,
+    status: str = "success",
+    error_msg: str | None = None,
+):
+    """
+    记录一次问答的审计日志。
+
+    审计写入失败不影响主流程（helper 内部捕获异常）。
+    """
+    if not settings.AUDIT_ENABLED:
+        return
+    usage = usage or {}
+    try:
+        await rag.vector_store.aadd_query_audit(
+            username=username,
+            conversation_id=conversation_id,
+            question=question,
+            answer=answer,
+            answer_type=answer_type,
+            collection=collection,
+            sources=sources or [],
+            k=k,
+            concise=concise,
+            from_cache=from_cache,
+            latency_ms=latency_ms,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            model=settings.LLM_MODEL_NAME,
+            status=status,
+            error_msg=error_msg,
+        )
+    except Exception as e:
+        logger.warning(f"查询审计写入失败: {e}")
 
 
 # ==============================================================================
@@ -535,6 +587,7 @@ async def query_knowledge_base(
     collection_name = body.collection
     conversation_id = body.conversation_id
     user_id = await _resolve_user_id(mgr, auth)
+    start_time = time.time()  # 查询审计：记录起始时刻
 
     # ---- 加载多轮对话历史（按 token 预算动态截断） ----
     history = await _load_conversation_history(mgr, conversation_id, user_id)
@@ -580,6 +633,26 @@ async def query_knowledge_base(
                 except Exception as e:
                     logger.warning(f"持久化对话失败: {e}")
 
+            # ---- 查询审计（空知识库分支） ----
+            try:
+                await _log_query_audit(
+                    rag,
+                    username=auth.get("username", "anonymous"),
+                    question=question,
+                    answer=answer,
+                    answer_type=result.get("answer_type", "general"),
+                    collection=None,
+                    sources=[s.model_dump() for s in sources],
+                    conversation_id=conversation_id,
+                    k=k,
+                    concise=concise,
+                    from_cache=result.get("from_cache", False),
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    usage=result.get("usage") or {},
+                )
+            except Exception:
+                pass
+
             return APIResponse(
                 code=0,
                 message="success",
@@ -597,6 +670,21 @@ async def query_knowledge_base(
             )
         except Exception as e:
             logger.error(f"问答接口异常: {e}", exc_info=True)
+            # 失败也记审计
+            try:
+                await _log_query_audit(
+                    rag,
+                    username=auth.get("username", "anonymous"),
+                    question=question,
+                    conversation_id=conversation_id,
+                    k=k,
+                    concise=concise,
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    status="failed",
+                    error_msg=str(e)[:500],
+                )
+            except Exception:
+                pass
             raise HTTPException(status_code=500, detail=f"问答服务异常: {e}")
 
     if collection_name and collection_name in all_collections:
@@ -645,6 +733,26 @@ async def query_knowledge_base(
             except Exception as e:
                 logger.warning(f"持久化对话失败: {e}")
 
+        # ---- 查询审计（正常分支） ----
+        try:
+            await _log_query_audit(
+                rag,
+                username=auth.get("username", "anonymous"),
+                question=question,
+                answer=answer,
+                answer_type=result.get("answer_type", "general"),
+                collection=target_collection,
+                sources=[s.model_dump() for s in sources],
+                conversation_id=conversation_id,
+                k=k,
+                concise=concise,
+                from_cache=result.get("from_cache", False),
+                latency_ms=int((time.time() - start_time) * 1000),
+                usage=result.get("usage") or {},
+            )
+        except Exception:
+            pass
+
         return APIResponse(
             code=0,
             message="success",
@@ -663,6 +771,21 @@ async def query_knowledge_base(
         )
     except Exception as e:
         logger.error(f"问答接口异常: {e}", exc_info=True)
+        # 失败也记审计
+        try:
+            await _log_query_audit(
+                rag,
+                username=auth.get("username", "anonymous"),
+                question=question,
+                conversation_id=conversation_id,
+                k=k,
+                concise=concise,
+                latency_ms=int((time.time() - start_time) * 1000),
+                status="failed",
+                error_msg=str(e)[:500],
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"问答服务异常: {e}")
 
 
@@ -688,6 +811,7 @@ async def query_knowledge_base_stream(
     collection_name = body.collection
     conversation_id = body.conversation_id
     user_id = await _resolve_user_id(mgr, auth)
+    start_time = time.time()  # 查询审计：记录起始时刻
     # 流式请求体没有 filter 字段，多集合检索的 filter_criteria 固定为 None
     filter_criteria = None
 
@@ -745,8 +869,43 @@ async def query_knowledge_base_stream(
                     except Exception as e:
                         logger.warning(f"持久化对话失败: {e}")
 
+                # ---- 查询审计（流式空知识库分支） ----
+                try:
+                    await _log_query_audit(
+                        rag,
+                        username=auth.get("username", "anonymous"),
+                        question=question,
+                        answer=full_answer,
+                        answer_type=answer_type,
+                        collection=None,
+                        sources=sources or [],
+                        conversation_id=conversation_id,
+                        k=k,
+                        concise=concise,
+                        from_cache=result.get("from_cache", False),
+                        latency_ms=int((time.time() - start_time) * 1000),
+                        usage=result.get("usage") or {},
+                    )
+                except Exception:
+                    pass
+
             except Exception as e:
                 logger.error(f"流式问答异常: {e}", exc_info=True)
+                # 失败也记审计
+                try:
+                    await _log_query_audit(
+                        rag,
+                        username=auth.get("username", "anonymous"),
+                        question=question,
+                        conversation_id=conversation_id,
+                        k=k,
+                        concise=concise,
+                        latency_ms=int((time.time() - start_time) * 1000),
+                        status="failed",
+                        error_msg=str(e)[:500],
+                    )
+                except Exception:
+                    pass
                 yield f"data: {json.dumps({'type': 'error', 'data': str(e)}, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(empty_kb_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
@@ -809,8 +968,43 @@ async def query_knowledge_base_stream(
                 except Exception as e:
                     logger.warning(f"持久化对话失败: {e}")
 
+            # ---- 查询审计（流式正常分支） ----
+            try:
+                await _log_query_audit(
+                    rag,
+                    username=auth.get("username", "anonymous"),
+                    question=question,
+                    answer=full_answer,
+                    answer_type=answer_type,
+                    collection=target_collection,
+                    sources=sources or [],
+                    conversation_id=conversation_id,
+                    k=k,
+                    concise=concise,
+                    from_cache=result.get("from_cache", False),
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    usage=result.get("usage") or {},
+                )
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"流式问答异常: {e}", exc_info=True)
+            # 失败也记审计
+            try:
+                await _log_query_audit(
+                    rag,
+                    username=auth.get("username", "anonymous"),
+                    question=question,
+                    conversation_id=conversation_id,
+                    k=k,
+                    concise=concise,
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    status="failed",
+                    error_msg=str(e)[:500],
+                )
+            except Exception:
+                pass
             yield f"data: {json.dumps({'type': 'error', 'data': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -1819,3 +2013,92 @@ async def update_message(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新消息失败: {e}")
+
+
+@router.post("/conversations/{conv_id}/messages/{msg_id}/feedback", summary="消息反馈（点赞/点踩）")
+async def set_message_feedback(
+    conv_id: int,
+    msg_id: int,
+    body: MessageFeedbackRequest,
+    rag: RAGPipeline = Depends(get_rag_pipeline),
+    mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
+):
+    """
+    对一条 AI 回答设置用户反馈：1=赞, -1=踩, 0=清除。
+
+    仅能操作当前用户的对话消息。
+    """
+    if body.feedback not in (-1, 0, 1):
+        raise HTTPException(status_code=400, detail="feedback 必须为 -1（踩）、0（清除）或 1（赞）")
+    try:
+        user_id = await _resolve_user_id(mgr, auth)
+        # 校验对话归属（消息须属于当前用户或匿名共享）
+        msgs = await mgr.aget_messages(conv_id, user_id=user_id)
+        if not any(m["id"] == msg_id for m in msgs):
+            raise HTTPException(status_code=404, detail="消息不存在或无权操作")
+        ok = await rag.vector_store.aset_message_feedback(
+            msg_id, body.feedback, body.comment
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="消息不存在")
+        return {"code": 0, "message": "success", "data": {"feedback": body.feedback}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"设置反馈失败: {e}")
+
+
+# ---------------------------------------------------------------
+# 查询审计（仅管理员）
+# ---------------------------------------------------------------
+
+async def _require_admin(request: Request, auth: dict):
+    """审计查询接口的管理员校验，返回用户管理器实例。"""
+    if not settings.AUTH_ENABLED:
+        return request.app.state.user_manager
+    username = auth.get("username")
+    if not username or username == "anonymous":
+        raise HTTPException(status_code=401, detail="需要登录")
+    um = request.app.state.user_manager
+    user = await um._store.aget_user_by_username(username)
+    if user is None or not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+    return um
+
+
+@router.get("/audit/queries", summary="查询审计列表（管理员）")
+async def list_query_audit(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    username: str | None = None,
+    rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
+):
+    """分页查询问答审计记录（按时间倒序），可选按用户名过滤。"""
+    await _require_admin(request, auth)
+    try:
+        rows = await rag.vector_store.alist_query_audit(
+            limit=min(limit, 200), offset=max(offset, 0), username=username,
+        )
+        return {"code": 0, "message": "success", "data": rows}
+    except Exception as e:
+        logger.error(f"查询审计失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询审计失败: {e}")
+
+
+@router.get("/audit/summary", summary="查询审计汇总（管理员）")
+async def get_query_audit_summary(
+    request: Request,
+    rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
+):
+    """查询问答审计汇总统计（总查询数、缓存命中率、平均延迟、Token 用量、热门问题等）。"""
+    await _require_admin(request, auth)
+    try:
+        summary = await rag.vector_store.aget_query_audit_summary()
+        return {"code": 0, "message": "success", "data": summary}
+    except Exception as e:
+        logger.error(f"查询审计汇总失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询审计汇总失败: {e}")

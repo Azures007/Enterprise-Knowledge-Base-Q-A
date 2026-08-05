@@ -98,6 +98,7 @@ class BailianLLM:
         prompt: str,
         system_prompt: str | None = None,
         history: list[dict[str, str]] | None = None,
+        usage_cb=None,
         **kwargs,
     ) -> str:
         """
@@ -107,6 +108,7 @@ class BailianLLM:
             prompt:        用户输入提示
             system_prompt: 系统提示词（可选）
             history:       历史对话列表，格式: [{"role": "user"|"assistant", "content": "..."}]
+            usage_cb:      可选回调，API 返回后把 token usage 传入（如用于审计）
             **kwargs:      可覆盖生成参数（temperature, max_tokens, top_p 等）
 
         Returns:
@@ -119,6 +121,7 @@ class BailianLLM:
         params = self._get_params(**kwargs)
 
         response_data = self._call_api(messages, params, stream=False)
+        self._notify_usage(response_data, usage_cb)
         return self._extract_content(response_data)
 
     def stream(
@@ -126,6 +129,7 @@ class BailianLLM:
         prompt: str,
         system_prompt: str | None = None,
         history: list[dict[str, str]] | None = None,
+        usage_cb=None,
         **kwargs,
     ) -> Generator[str, None, None]:
         """
@@ -135,6 +139,7 @@ class BailianLLM:
             prompt:        用户输入提示
             system_prompt: 系统提示词（可选）
             history:       历史对话列表
+            usage_cb:      可选回调，流结束后把 token usage 传入（如用于审计）
             **kwargs:      可覆盖生成参数
 
         Yields:
@@ -143,7 +148,7 @@ class BailianLLM:
         messages = self._build_messages(prompt, system_prompt, history)
         params = self._get_params(**kwargs)
 
-        for chunk in self._call_api_stream(messages, params):
+        for chunk in self._call_api_stream(messages, params, usage_cb=usage_cb):
             yield chunk
 
     def chat(
@@ -178,6 +183,7 @@ class BailianLLM:
         prompt: str,
         system_prompt: str | None = None,
         history: list[dict[str, str]] | None = None,
+        usage_cb=None,
         **kwargs,
     ) -> str:
         """
@@ -187,6 +193,7 @@ class BailianLLM:
             prompt:        用户输入提示
             system_prompt: 系统提示词（可选）
             history:       历史对话列表
+            usage_cb:      可选回调，API 返回后把 token usage 传入（如用于审计）
             **kwargs:      可覆盖生成参数
 
         Returns:
@@ -195,6 +202,7 @@ class BailianLLM:
         messages = self._build_messages(prompt, system_prompt, history)
         params = self._get_params(**kwargs)
         response_data = await self._acall_api(messages, params, stream=False)
+        self._notify_usage(response_data, usage_cb)
         return self._extract_content(response_data)
 
     async def astream(
@@ -202,6 +210,7 @@ class BailianLLM:
         prompt: str,
         system_prompt: str | None = None,
         history: list[dict[str, str]] | None = None,
+        usage_cb=None,
         **kwargs,
     ):
         """
@@ -211,6 +220,7 @@ class BailianLLM:
             prompt:        用户输入提示
             system_prompt: 系统提示词（可选）
             history:       历史对话列表
+            usage_cb:      可选回调，流结束后把 token usage 传入（如用于审计）
             **kwargs:      可覆盖生成参数
 
         Yields:
@@ -219,7 +229,7 @@ class BailianLLM:
         messages = self._build_messages(prompt, system_prompt, history)
         params = self._get_params(**kwargs)
 
-        async for chunk in self._acall_api_stream(messages, params):
+        async for chunk in self._acall_api_stream(messages, params, usage_cb=usage_cb):
             yield chunk
 
     async def achat(
@@ -344,17 +354,42 @@ class BailianLLM:
             f"LLM API 调用失败（已达最大重试次数 {self.max_retries}）: {last_error}"
         )
 
+    @staticmethod
+    def _notify_usage(response_data: dict[str, Any], usage_cb) -> None:
+        """
+        从 API 响应中提取 usage 并回调（若有）。
+
+        OpenAI 兼容格式的响应体含 "usage" 字段：{"prompt_tokens", "completion_tokens", "total_tokens"}。
+        """
+        if usage_cb is None:
+            return
+        usage = response_data.get("usage")
+        if usage:
+            try:
+                usage_cb(usage)
+            except Exception as e:
+                logger.warning(f"usage 回调失败: {e}")
+
     def _call_api_stream(
         self,
         messages: list[dict[str, str]],
         params: dict[str, Any],
+        usage_cb=None,
     ) -> Generator[str, None, None]:
         """
         流式调用 Chat API。
 
+        Args:
+            messages:  消息列表
+            params:    生成参数
+            usage_cb:  可选回调，流结束后把 token usage 传入（OpenAI 兼容
+                       端点在最后一个 SSE chunk 返回 usage）
+
         Yields:
             文本片段
         """
+        usage_data: dict | None = None
+
         try:
             payload = {
                 "model": self.model,
@@ -389,7 +424,14 @@ class BailianLLM:
 
                     try:
                         chunk = json.loads(data_str)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        # 最后一个 chunk 的 choices 为空列表、usage 携带总量
+                        usage = chunk.get("usage")
+                        if usage:
+                            usage_data = usage
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
                             yield content
@@ -399,6 +441,13 @@ class BailianLLM:
         except Exception as e:
             logger.error(f"流式调用失败: {e}")
             raise BailianLLMError(f"流式生成失败: {e}") from e
+
+        finally:
+            if usage_cb is not None and usage_data:
+                try:
+                    usage_cb(usage_data)
+                except Exception as e:
+                    logger.warning(f"usage 回调失败: {e}")
 
     async def _acall_api(
         self,
@@ -481,13 +530,21 @@ class BailianLLM:
         self,
         messages: list[dict[str, str]],
         params: dict[str, Any],
+        usage_cb=None,
     ):
         """
         异步流式调用 Chat API。
 
+        Args:
+            messages:  消息列表
+            params:    生成参数
+            usage_cb:  可选回调，流结束后把 token usage 传入
+
         Yields:
             文本片段
         """
+        usage_data: dict | None = None
+
         try:
             payload = {
                 "model": self.model,
@@ -522,7 +579,14 @@ class BailianLLM:
 
                         try:
                             chunk = json.loads(data_str)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            # 最后一个 chunk 的 choices 为空列表、usage 携带总量
+                            usage = chunk.get("usage")
+                            if usage:
+                                usage_data = usage
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
                             if content:
                                 yield content
@@ -532,6 +596,13 @@ class BailianLLM:
         except Exception as e:
             logger.error(f"异步流式调用失败: {e}")
             raise BailianLLMError(f"异步流式生成失败: {e}") from e
+
+        finally:
+            if usage_cb is not None and usage_data:
+                try:
+                    usage_cb(usage_data)
+                except Exception as e:
+                    logger.warning(f"usage 回调失败: {e}")
 
     @staticmethod
     async def _asleep(seconds: float):

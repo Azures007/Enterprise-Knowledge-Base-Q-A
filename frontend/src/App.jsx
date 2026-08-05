@@ -4,6 +4,7 @@ import ChatArea from './components/ChatArea'
 import LoginPage from './components/LoginPage'
 import UserManagementModal from './components/UserManagementModal'
 import ChangePasswordModal from './components/ChangePasswordModal'
+import AuditModal from './components/AuditModal'
 import {
   checkHealth,
   getCollections,
@@ -21,6 +22,7 @@ export default function App() {
   const [authed, setAuthed] = useState(isLoggedIn())
   const [showUserModal, setShowUserModal] = useState(false)
   const [showPwdModal, setShowPwdModal] = useState(false)
+  const [showAuditModal, setShowAuditModal] = useState(false)
 
   // 知识库
   const [collections, setCollections] = useState([])
@@ -224,6 +226,11 @@ export default function App() {
               👥 用户
             </button>
           )}
+          {isAdmin() && (
+            <button className="logout-button" onClick={() => setShowAuditModal(true)} title="查询审计">
+              📊 审计
+            </button>
+          )}
           <button className="logout-button" onClick={() => setShowPwdModal(true)} title="修改密码">
             🔑 改密码
           </button>
@@ -239,6 +246,10 @@ export default function App() {
 
       {showPwdModal && (
         <ChangePasswordModal onClose={() => setShowPwdModal(false)} />
+      )}
+
+      {showAuditModal && (
+        <AuditModal onClose={() => setShowAuditModal(false)} />
       )}
 
       <div className="app-body">

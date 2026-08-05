@@ -593,6 +593,36 @@ export async function updateMessageContent(convId, msgId, { content, sources }) 
 }
 
 /**
+ * 对 AI 消息提交反馈（1=赞, -1=踩, 0=清除）
+ */
+export async function sendMessageFeedback(convId, msgId, { feedback, comment }) {
+  return request(`/conversations/${convId}/messages/${msgId}/feedback`, {
+    method: 'POST',
+    body: JSON.stringify({ feedback, comment }),
+  })
+}
+
+/**
+ * 查询审计列表（管理员），params: { limit, offset, username }
+ */
+export async function getAuditQueries(params) {
+  const qs = new URLSearchParams()
+  if (params) {
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, v)
+    })
+  }
+  return request(`/audit/queries?${qs.toString()}`)
+}
+
+/**
+ * 查询审计汇总（管理员）
+ */
+export async function getAuditSummary() {
+  return request('/audit/summary')
+}
+
+/**
  * 删除集合
  */
 export async function deleteCollection(name = 'knowledge_base') {

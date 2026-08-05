@@ -2020,3 +2020,317 @@ body {
   color: var(--color-primary);
   background: var(--color-primary-bg);
 }
+
+/* =============================================================================
+   用户反馈按钮（点赞/点踩）
+   ============================================================================= */
+.feedback-actions {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.feedback-btn {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all var(--transition);
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.feedback-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-primary-bg);
+}
+
+.feedback-btn.active-up {
+  border-color: var(--color-success);
+  color: var(--color-success);
+  background: rgba(5, 150, 105, 0.08);
+}
+
+.feedback-btn.active-down {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+  background: rgba(220, 38, 38, 0.08);
+}
+
+.feedback-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.feedback-clear {
+  background: none;
+  border: none;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 3px 4px;
+  text-decoration: underline;
+  font-family: inherit;
+}
+
+.feedback-reason {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  width: 100%;
+}
+
+.feedback-reason input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: inherit;
+}
+
+.feedback-reason input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.btn-ghost {
+  background: none;
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.btn-ghost:hover {
+  border-color: var(--color-text-muted);
+  color: var(--color-text);
+}
+
+/* =============================================================================
+   查询审计管理弹窗
+   ============================================================================= */
+.audit-modal {
+  width: 820px;
+  max-width: 94vw;
+}
+
+.audit-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.audit-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  text-align: center;
+}
+
+.audit-card-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-primary);
+}
+
+.audit-card-label {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 2px;
+}
+
+.audit-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin: 10px 0 6px;
+}
+
+.audit-top-questions {
+  margin-bottom: 6px;
+}
+
+.audit-top-list {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.audit-top-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.audit-top-item + .audit-top-item {
+  border-top: 1px solid var(--color-border);
+}
+
+.audit-top-rank {
+  font-weight: 700;
+  color: var(--color-primary);
+  min-width: 18px;
+}
+
+.audit-top-question {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-top-count {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.audit-table-wrap {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.audit-table th {
+  text-align: left;
+  padding: 8px 10px;
+  background: var(--color-sidebar);
+  color: var(--color-text-secondary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.audit-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: middle;
+}
+
+.audit-table tbody tr.audit-row {
+  cursor: pointer;
+}
+
+.audit-table tbody tr.audit-row:hover {
+  background: var(--color-primary-bg);
+}
+
+.audit-cell-time {
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.audit-cell-question {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.badge-kb {
+  background: rgba(37, 99, 235, 0.12);
+  color: var(--color-primary);
+}
+
+.badge-hybrid {
+  background: rgba(217, 119, 6, 0.12);
+  color: var(--color-warning);
+}
+
+.badge-general {
+  background: rgba(5, 150, 105, 0.12);
+  color: var(--color-success);
+}
+
+.badge-other {
+  background: var(--color-sidebar);
+  color: var(--color-text-secondary);
+}
+
+.audit-expand-row td {
+  background: var(--color-sidebar);
+}
+
+.audit-expand {
+  padding: 4px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.audit-expand-label {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+.audit-expand-question,
+.audit-expand-sources {
+  display: flex;
+  align-items: baseline;
+  font-size: 12px;
+}
+
+.audit-expand-question {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.audit-expand-answer {
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.audit-expand-answer-text {
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-top: 4px;
+}
+
+.audit-expand-sources {
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.audit-expand-source {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.audit-expand-error {
+  font-size: 12px;
+  color: var(--color-danger);
+}

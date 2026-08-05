@@ -138,6 +138,13 @@ class UpdateMessageRequest(BaseModel):
     sources: Optional[list[dict[str, Any]]] = Field(None, description="引用来源")
 
 
+class MessageFeedbackRequest(BaseModel):
+    """消息反馈请求体"""
+
+    feedback: int = Field(..., description="1=赞, -1=踩, 0=清除")
+    comment: Optional[str] = Field(None, max_length=500, description="点踩原因（可选）")
+
+
 class UpdateConversationTitleRequest(BaseModel):
     """修改对话标题请求体"""
 

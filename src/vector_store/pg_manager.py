@@ -315,6 +315,25 @@ class PGVectorStore:
                 )
             except Exception:
                 pass
+            # 兼容旧表：无反馈列时补充（用户点赞/点踩，1=赞 -1=踩 NULL=无）
+            try:
+                await conn.execute(
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS feedback SMALLINT"
+                )
+            except Exception:
+                pass
+            try:
+                await conn.execute(
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS feedback_comment TEXT"
+                )
+            except Exception:
+                pass
+            try:
+                await conn.execute(
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS feedback_at TIMESTAMP"
+                )
+            except Exception:
+                pass
 
             # 向量索引（HNSW）
             await conn.execute("""
@@ -380,6 +399,66 @@ class PGVectorStore:
                     last_login_at   TIMESTAMP
                 )
             """)
+
+            # 查询审计日志表（每次问答一条）
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS query_audit_log (
+                    id                SERIAL PRIMARY KEY,
+                    username          VARCHAR(255),
+                    user_id           INTEGER,
+                    conversation_id   INTEGER,
+                    question          TEXT,
+                    answer            TEXT,
+                    answer_type       VARCHAR(20),
+                    collection        VARCHAR(255),
+                    sources           JSONB DEFAULT '[]'::jsonb,
+                    k                 INTEGER,
+                    concise           BOOLEAN DEFAULT false,
+                    from_cache        BOOLEAN DEFAULT false,
+                    latency_ms        INTEGER,
+                    prompt_tokens     INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens      INTEGER,
+                    model             VARCHAR(64),
+                    status            VARCHAR(20) DEFAULT 'success',
+                    error_msg         TEXT,
+                    created_at        TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            # 兼容旧表：缺列时自动补充（迁移安全）
+            for col_sql in (
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS user_id INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS conversation_id INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS answer TEXT',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS collection VARCHAR(255)',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS sources JSONB DEFAULT \'[]\'::jsonb',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS k INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS concise BOOLEAN DEFAULT false',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS from_cache BOOLEAN DEFAULT false',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS latency_ms INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS completion_tokens INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS total_tokens INTEGER',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS model VARCHAR(64)',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT \'success\'',
+                'ALTER TABLE query_audit_log ADD COLUMN IF NOT EXISTS error_msg TEXT',
+            ):
+                try:
+                    await conn.execute(col_sql)
+                except Exception:
+                    pass
+            try:
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_query_audit_created ON query_audit_log(created_at)"
+                )
+            except Exception:
+                pass
+            try:
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_query_audit_user ON query_audit_log(username)"
+                )
+            except Exception:
+                pass
 
         logger.info("PostgreSQL 数据库表初始化完成")
 
@@ -1258,7 +1337,8 @@ class PGVectorStore:
                     return []
             rows = await conn.fetch(
                 """
-                SELECT id, role, content, sources, answer_type, is_stale, created_at
+                SELECT id, role, content, sources, answer_type, is_stale,
+                       feedback, feedback_comment, feedback_at, created_at
                 FROM messages
                 WHERE conversation_id = $1
                 ORDER BY created_at ASC, id ASC
@@ -1273,6 +1353,9 @@ class PGVectorStore:
                 "sources": _json_or_dict(r["sources"]) if r["sources"] else [],
                 "answer_type": r["answer_type"],
                 "is_stale": bool(r["is_stale"]),
+                "feedback": r["feedback"],
+                "feedback_comment": r["feedback_comment"],
+                "feedback_at": r["feedback_at"].isoformat() if r["feedback_at"] else None,
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }
             for r in rows
@@ -1326,6 +1409,43 @@ class PGVectorStore:
                 await conn.execute(
                     "UPDATE messages SET content = $1, sources = $2::jsonb WHERE id = $3",
                     content, sources_json, msg_id,
+                )
+            ) > 0
+
+    async def aset_message_feedback(
+        self, msg_id: int, feedback: int, comment: str | None = None,
+    ) -> bool:
+        """
+        设置消息的用户反馈（点赞/点踩）。
+
+        Args:
+            msg_id:   消息 ID
+            feedback: 1=赞, -1=踩, 0=清除反馈
+            comment:  点踩原因（可选）
+
+        Returns:
+            是否成功更新
+        """
+        async with (await self._aconn()).acquire() as conn:
+            if feedback == 0:
+                return _parse_rowcount(
+                    await conn.execute(
+                        """
+                        UPDATE messages
+                        SET feedback = NULL, feedback_comment = NULL, feedback_at = NULL
+                        WHERE id = $1
+                        """,
+                        msg_id,
+                    )
+                ) > 0
+            return _parse_rowcount(
+                await conn.execute(
+                    """
+                    UPDATE messages
+                    SET feedback = $1, feedback_comment = $2, feedback_at = NOW()
+                    WHERE id = $3
+                    """,
+                    feedback, comment, msg_id,
                 )
             ) > 0
 
@@ -1564,6 +1684,181 @@ class PGVectorStore:
             ) > 0
 
     # ================================================================
+    # 查询审计（异步核心）
+    # ================================================================
+
+    async def aadd_query_audit(
+        self,
+        *,
+        username: str | None = None,
+        user_id: int | None = None,
+        conversation_id: int | None = None,
+        question: str = "",
+        answer: str = "",
+        answer_type: str = "",
+        collection: str | None = None,
+        sources: list | None = None,
+        k: int | None = None,
+        concise: bool = False,
+        from_cache: bool = False,
+        latency_ms: int | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        model: str | None = None,
+        status: str = "success",
+        error_msg: str | None = None,
+    ) -> None:
+        """
+        记录一次问答的审计日志。
+
+        写入失败仅记 warning，不抛出（审计不应影响主流程）。
+        """
+        sources_json = json.dumps(sources or [], ensure_ascii=False)
+        try:
+            async with (await self._aconn()).acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO query_audit_log
+                    (username, user_id, conversation_id, question, answer,
+                     answer_type, collection, sources, k, concise, from_cache,
+                     latency_ms, prompt_tokens, completion_tokens, total_tokens,
+                     model, status, error_msg)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11,
+                            $12, $13, $14, $15, $16, $17, $18)
+                    """,
+                    username, user_id, conversation_id, question, answer,
+                    answer_type, collection, sources_json, k, concise, from_cache,
+                    latency_ms, prompt_tokens, completion_tokens, total_tokens,
+                    model, status, error_msg,
+                )
+            logger.debug(f"查询审计已记录: user={username}, q='{question[:40]}'")
+        except Exception as e:
+            logger.warning(f"查询审计记录失败: {e}")
+
+    async def alist_query_audit(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        username: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """分页查询审计记录（按时间倒序），可选按用户名过滤。"""
+        async with (await self._aconn()).acquire() as conn:
+            if username:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, username, user_id, conversation_id, question, answer,
+                           answer_type, collection, sources, k, concise, from_cache,
+                           latency_ms, prompt_tokens, completion_tokens, total_tokens,
+                           model, status, error_msg, created_at
+                    FROM query_audit_log
+                    WHERE username = $1
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $2 OFFSET $3
+                    """,
+                    username, limit, offset,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, username, user_id, conversation_id, question, answer,
+                           answer_type, collection, sources, k, concise, from_cache,
+                           latency_ms, prompt_tokens, completion_tokens, total_tokens,
+                           model, status, error_msg, created_at
+                    FROM query_audit_log
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT $1 OFFSET $2
+                    """,
+                    limit, offset,
+                )
+        return [
+            {
+                "id": r["id"],
+                "username": r["username"],
+                "user_id": r["user_id"],
+                "conversation_id": r["conversation_id"],
+                "question": r["question"],
+                "answer": r["answer"],
+                "answer_type": r["answer_type"],
+                "collection": r["collection"],
+                "sources": _json_or_dict(r["sources"]) if r["sources"] else [],
+                "k": r["k"],
+                "concise": bool(r["concise"]),
+                "from_cache": bool(r["from_cache"]),
+                "latency_ms": r["latency_ms"],
+                "prompt_tokens": r["prompt_tokens"],
+                "completion_tokens": r["completion_tokens"],
+                "total_tokens": r["total_tokens"],
+                "model": r["model"],
+                "status": r["status"],
+                "error_msg": r["error_msg"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+
+    async def aget_query_audit_summary(self) -> dict[str, Any]:
+        """
+        查询审计汇总统计（一次 SQL 聚合）。
+
+        Returns:
+            dict 含 total_queries, cache_hit_count, cache_hit_rate,
+                 avg_latency_ms, total_tokens, answer_type_dist, top_questions
+        """
+        async with (await self._aconn()).acquire() as conn:
+            # 整体统计（仅成功记录计入延迟/缓存率）
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total_queries,
+                    COUNT(*) FILTER (WHERE from_cache) AS cache_hit_count,
+                    ROUND(AVG(latency_ms) FILTER (WHERE status = 'success')) AS avg_latency_ms,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens
+                FROM query_audit_log
+                """
+            )
+            # 回答类型分布
+            type_rows = await conn.fetch(
+                """
+                SELECT answer_type, COUNT(*) AS cnt
+                FROM query_audit_log
+                GROUP BY answer_type
+                ORDER BY cnt DESC
+                """
+            )
+            # 热门问题 TopN
+            q_rows = await conn.fetch(
+                """
+                SELECT question, COUNT(*) AS cnt
+                FROM query_audit_log
+                WHERE question <> ''
+                GROUP BY question
+                ORDER BY cnt DESC
+                LIMIT 10
+                """
+            )
+
+        total = row["total_queries"] or 0
+        cache_hits = row["cache_hit_count"] or 0
+        return {
+            "total_queries": total,
+            "cache_hit_count": cache_hits,
+            "cache_hit_rate": round(cache_hits / total, 4) if total else 0.0,
+            "avg_latency_ms": row["avg_latency_ms"],
+            "total_tokens": row["total_tokens"],
+            "total_prompt_tokens": row["total_prompt_tokens"],
+            "total_completion_tokens": row["total_completion_tokens"],
+            "answer_type_dist": [
+                {"answer_type": r["answer_type"], "count": r["cnt"]} for r in type_rows
+            ],
+            "top_questions": [
+                {"question": r["question"], "count": r["cnt"]} for r in q_rows
+            ],
+        }
+
+    # ================================================================
     # 同步 shim（CLI 工具兼容，通过 asyncio.run 桥接）
     # ================================================================
 
@@ -1633,6 +1928,18 @@ class PGVectorStore:
 
     def update_message_content(self, msg_id, content, sources=None) -> bool:
         return self._sync(lambda: self.aupdate_message_content(msg_id, content, sources))
+
+    def set_message_feedback(self, msg_id, feedback, comment=None) -> bool:
+        return self._sync(lambda: self.aset_message_feedback(msg_id, feedback, comment))
+
+    def add_query_audit(self, **fields) -> None:
+        return self._sync(lambda: self.aadd_query_audit(**fields))
+
+    def list_query_audit(self, limit=50, offset=0, username=None) -> list[dict]:
+        return self._sync(lambda: self.alist_query_audit(limit, offset, username))
+
+    def get_query_audit_summary(self) -> dict:
+        return self._sync(lambda: self.aget_query_audit_summary())
 
     # 用户管理同步 shim
     def create_user(self, username, password_hash, display_name=None, is_admin=False) -> int:

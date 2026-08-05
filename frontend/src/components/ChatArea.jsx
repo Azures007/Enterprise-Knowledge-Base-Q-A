@@ -36,14 +36,6 @@ export default function ChatArea({
     if (!loading) inputRef.current?.focus()
   }, [loading])
 
-  // 暴露全局问问题入口（供"相关问题"按钮点击发送）
-  useEffect(() => {
-    window.__askQuestion = (q) => {
-      sendMessage(q)
-    }
-    return () => { delete window.__askQuestion }
-  }, [sendMessage])
-
   // 停止当前回答
   const handleStop = useCallback(() => {
     if (abortRef.current) {
@@ -139,6 +131,10 @@ export default function ChatArea({
                 answer_type: finalAnswerType,
               })
               savedAiMsgId.current = res.data?.id
+              // 把后端返回的消息 id 补进本地消息，供反馈按钮关联
+              if (res.data?.id) {
+                updateLastMessage((prev) => ({ ...prev, id: res.data.id }))
+              }
             } catch (err) {
               console.warn('保存 AI 消息失败:', err.message)
             }
@@ -179,6 +175,15 @@ export default function ChatArea({
     )
   }, [input, loading, serverOnline, currentConvId, addMessage, updateLastMessage, onConversationUpdated])
 
+  // 暴露全局问问题入口（供"相关问题"按钮点击发送）
+  // 放在 sendMessage 定义之后，避免 TDZ（暂时性死区）错误
+  useEffect(() => {
+    window.__askQuestion = (q) => {
+      sendMessage(q)
+    }
+    return () => { delete window.__askQuestion }
+  }, [sendMessage])
+
   // 键盘事件处理
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -210,7 +215,7 @@ export default function ChatArea({
           </div>
         ) : (
           messages.map((msg, i) => (
-            <MessageBubble key={msg.id || msg._id || i} message={msg} />
+            <MessageBubble key={msg.id || msg._id || i} message={msg} currentConvId={currentConvId} />
           ))
         )}
         <div ref={messagesEndRef} />
