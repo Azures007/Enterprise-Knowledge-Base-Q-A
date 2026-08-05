@@ -175,9 +175,30 @@ app.include_router(router)
 # 注册前端静态文件（生产模式）
 FRONTEND_DIST = settings.PROJECT_ROOT / "frontend" / "dist"
 if FRONTEND_DIST.exists():
+    # Windows 上 Python 的 mimetypes 可能从注册表误识别 .js 为 text/plain，
+    # 导致浏览器严格 MIME 检查拒绝加载前端模块脚本。这里显式纠正。
+    # 注意：不要在 add_type 之后调用 mimetypes.init()，那会重新加载注册表覆盖本次修正。
+    import mimetypes
+
+    if mimetypes.guess_type("app.js")[0] != "application/javascript":
+        mimetypes.add_type("application/javascript", ".js", strict=True)
+        logger.info("已纠正 .js 文件的 MIME 类型为 application/javascript")
+
+    class NoCacheStaticFiles(StaticFiles):
+        """静态文件挂载：附加 no-cache 头，避免浏览器缓存旧的构建产物。"""
+
+        def file_response(
+            self, full_path, stat_result=None, scope=None, status_code=200
+        ):
+            response = super().file_response(
+                full_path, stat_result=stat_result, scope=scope, status_code=status_code
+            )
+            response.headers.setdefault("Cache-Control", "no-cache")
+            return response
+
     app.mount(
         "/assets",
-        StaticFiles(directory=str(FRONTEND_DIST / "assets")),
+        NoCacheStaticFiles(directory=str(FRONTEND_DIST / "assets")),
         name="frontend_assets",
     )
 
@@ -203,6 +224,6 @@ if __name__ == "__main__":
         "app:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=True,
+        reload=False,
         log_level="info",
     )
