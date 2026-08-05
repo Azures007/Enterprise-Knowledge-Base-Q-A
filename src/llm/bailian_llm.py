@@ -170,6 +170,71 @@ class BailianLLM:
         return self._extract_content(response_data)
 
     # ================================================================
+    # 异步接口（用于 FastAPI 事件循环内调用，不阻塞其他请求）
+    # ================================================================
+
+    async def agenerate(
+        self,
+        prompt: str,
+        system_prompt: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        **kwargs,
+    ) -> str:
+        """
+        异步生成文本（非流式）。
+
+        Args:
+            prompt:        用户输入提示
+            system_prompt: 系统提示词（可选）
+            history:       历史对话列表
+            **kwargs:      可覆盖生成参数
+
+        Returns:
+            生成的文本内容
+        """
+        messages = self._build_messages(prompt, system_prompt, history)
+        params = self._get_params(**kwargs)
+        response_data = await self._acall_api(messages, params, stream=False)
+        return self._extract_content(response_data)
+
+    async def astream(
+        self,
+        prompt: str,
+        system_prompt: str | None = None,
+        history: list[dict[str, str]] | None = None,
+        **kwargs,
+    ):
+        """
+        异步流式生成文本。
+
+        Args:
+            prompt:        用户输入提示
+            system_prompt: 系统提示词（可选）
+            history:       历史对话列表
+            **kwargs:      可覆盖生成参数
+
+        Yields:
+            逐个生成的文本片段
+        """
+        messages = self._build_messages(prompt, system_prompt, history)
+        params = self._get_params(**kwargs)
+
+        async for chunk in self._acall_api_stream(messages, params):
+            yield chunk
+
+    async def achat(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs,
+    ) -> str:
+        """
+        异步多轮对话（直接传入消息列表）。
+        """
+        params = self._get_params(**kwargs)
+        response_data = await self._acall_api(messages, params, stream=False)
+        return self._extract_content(response_data)
+
+    # ================================================================
     # 内部方法
     # ================================================================
 
@@ -334,6 +399,145 @@ class BailianLLM:
         except Exception as e:
             logger.error(f"流式调用失败: {e}")
             raise BailianLLMError(f"流式生成失败: {e}") from e
+
+    async def _acall_api(
+        self,
+        messages: list[dict[str, str]],
+        params: dict[str, Any],
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        """
+        异步调用 Chat API（与 _call_api 相同语义，使用 httpx.AsyncClient）。
+
+        Args:
+            messages: 消息列表
+            params:   生成参数
+            stream:   是否为流式调用
+
+        Returns:
+            API 响应数据
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": stream,
+                    **params,
+                }
+
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(
+                        self._chat_url,
+                        json=payload,
+                        headers=headers,
+                    )
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status = e.response.status_code
+                body = e.response.text
+                logger.warning(
+                    f"LLM API HTTP 错误(异步) (尝试 {attempt}/{self.max_retries}): "
+                    f"status={status}, body={body[:300]}"
+                )
+                if status in (400, 401, 403):
+                    raise BailianLLMError(
+                        f"API 请求被拒绝: status={status}, detail={body[:300]}"
+                    ) from e
+                if status == 429:
+                    await self._asleep(self.retry_delay * attempt * 2)
+                    continue
+
+            except httpx.TimeoutException as e:
+                last_error = e
+                logger.warning(
+                    f"LLM API 超时(异步) (尝试 {attempt}/{self.max_retries})"
+                )
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"LLM API 未知错误(异步) (尝试 {attempt}/{self.max_retries}): {e}"
+                )
+
+            if attempt < self.max_retries:
+                await self._asleep(self.retry_delay * attempt)
+
+        raise BailianLLMError(
+            f"LLM API 异步调用失败（已达最大重试次数 {self.max_retries}）: {last_error}"
+        )
+
+    async def _acall_api_stream(
+        self,
+        messages: list[dict[str, str]],
+        params: dict[str, Any],
+    ):
+        """
+        异步流式调用 Chat API。
+
+        Yields:
+            文本片段
+        """
+        try:
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+                **params,
+            }
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream(
+                    "POST",
+                    self._chat_url,
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+
+                        data_str = line[6:]  # 去掉 "data: " 前缀
+                        if data_str.strip() == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                        except json.JSONDecodeError:
+                            continue
+
+        except Exception as e:
+            logger.error(f"异步流式调用失败: {e}")
+            raise BailianLLMError(f"异步流式生成失败: {e}") from e
+
+    @staticmethod
+    async def _asleep(seconds: float):
+        """异步等待（供异步重试逻辑使用）"""
+        import asyncio
+        await asyncio.sleep(seconds)
 
     @staticmethod
     def _extract_content(response_data: dict[str, Any]) -> str:

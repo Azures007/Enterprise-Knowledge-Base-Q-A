@@ -258,6 +258,7 @@ class PGConversationManager:
     基于 PostgreSQL 的对话管理器。
 
     与 ConversationManager 接口兼容，内部委托给 PGVectorStore。
+    提供同步与异步（a* 前缀）两套方法。
     """
 
     def __init__(self, vector_store=None):
@@ -302,3 +303,38 @@ class PGConversationManager:
     def update_message_content(self, msg_id: int, content: str,
                                 sources=None) -> bool:
         return self._store.update_message_content(msg_id, content, sources)
+
+    # ================================================================
+    # 异步方法（供 FastAPI 事件循环调用）
+    # ================================================================
+
+    async def alist_conversations(self, user_id: int | None = None) -> list[dict]:
+        return await self._store.alist_conversations(user_id=user_id)
+
+    async def acreate_conversation(self, title=None, user_id: int | None = None) -> dict:
+        return await self._store.acreate_conversation(title, user_id=user_id)
+
+    async def adelete_conversation(self, conv_id: int, user_id: int | None = None) -> bool:
+        return await self._store.adelete_conversation(conv_id, user_id=user_id)
+
+    async def aupdate_title(self, conv_id: int, title: str, user_id: int | None = None) -> bool:
+        return await self._store.aupdate_conversation_title(conv_id, title, user_id=user_id)
+
+    async def aget_messages(self, conv_id: int, user_id: int | None = None) -> list[dict]:
+        return await self._store.aget_conversation_messages(conv_id, user_id=user_id)
+
+    async def aadd_message(self, conv_id: int, role: str, content: str,
+                           sources=None, answer_type=None) -> int:
+        return await self._store.aadd_message(conv_id, role, content, sources, answer_type)
+
+    async def aupdate_message_content(self, msg_id: int, content: str,
+                                      sources=None) -> bool:
+        return await self._store.aupdate_message_content(msg_id, content, sources)
+
+    async def aget_user_id(self, username: str) -> int | None:
+        """按用户名查询用户 ID（用于对话归属校验）。"""
+        try:
+            user = await self._store.aget_user_by_username(username)
+            return user["id"] if user else None
+        except Exception:
+            return None

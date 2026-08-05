@@ -11,6 +11,7 @@ export default function Sidebar({
   conversations,
   currentConvId,
   serverOnline,
+  isAdmin,
   onUploadSuccess,
   onClearMessages,
   onRefresh,
@@ -22,6 +23,7 @@ export default function Sidebar({
   const [toast, setToast] = useState(null)
   const [showDeleteModal, setShowDeleteModal] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState(null)
+  const [deleteTargetInfo, setDeleteTargetInfo] = useState(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [createValue, setCreateValue] = useState('')
   const [showRenameCollModal, setShowRenameCollModal] = useState(false)
@@ -129,7 +131,7 @@ export default function Sidebar({
                   <div className="collection-item-actions">
                     <button className="coll-btn-sm" onClick={() => { setViewCollection(name) }} title="查看内容">📄</button>
                     <button className="coll-btn-sm" onClick={() => { setRenameCollTarget(name); setRenameCollValue(name); setShowRenameCollModal(true) }} title="重命名">✏️</button>
-                    <button className="coll-btn-sm coll-btn-del" onClick={() => { setDeleteTarget(name); setShowDeleteModal(true) }} title="删除">🗑️</button>
+                    <button className="coll-btn-sm coll-btn-del" onClick={() => { setDeleteTarget(name); setDeleteTargetInfo(collectionDetails.find(c => (c.name || c) === name) || null); setShowDeleteModal(true) }} title="删除">🗑️</button>
                   </div>
                 </div>
               )
@@ -210,6 +212,9 @@ export default function Sidebar({
             <div className="modal-title">⚠️ 确认删除</div>
             <div className="modal-body">
               确定要删除集合 "<strong>{deleteTarget}</strong>" 吗？<br />
+              该集合包含
+              <strong> {deleteTargetInfo?.document_count ?? 0} 个文档</strong>
+              、<strong> {deleteTargetInfo?.chunk_count ?? 0} 个文档块</strong>。<br />
               该操作会同时删除集合内的所有文档块和 OSS 上的原始文件，不可恢复。
             </div>
             <div className="modal-actions">

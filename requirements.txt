@@ -40,7 +40,8 @@ pydantic>=2.5.0               # 数据校验
 pydantic-settings>=2.1.0      # 配置管理
 
 # --- PostgreSQL + pgvector ---
-psycopg2-binary>=2.9.0       # PostgreSQL 驱动
+asyncpg>=0.29.0               # 异步 PostgreSQL 驱动（API 服务）
+psycopg2-binary>=2.9.0       # 同步 PostgreSQL 驱动（CLI 工具）
 
 # --- 限流（可选，Redis 不可用时自动降级内存） ---
 redis>=5.0.0                 # Redis 驱动（不安装也不影响，自动降级为内存限流）
@@ -52,7 +53,10 @@ redis>=5.0.0                 # Redis 驱动（不安装也不影响，自动降�
 # boto3>=1.34.0               # AWS S3 SDK（切换到 S3 时安装）
 
 # --- HTTP 客户端 ---
-httpx>=0.27.0                 # HTTP 请求
+httpx>=0.27.0                 # HTTP 请求（同步 + 异步）
+
+# --- 认证 ---
+PyJWT>=2.8.0                  # JWT 令牌签发与校验
 
 # --- 其它 ---
 colorama>=0.4.6               # 彩色终端输出

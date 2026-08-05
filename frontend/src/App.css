@@ -568,12 +568,19 @@ body {
 
 .source-item {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 4px;
   padding: 6px 10px;
   background: var(--color-sidebar);
   border-radius: var(--radius-sm);
   font-size: 12px;
+}
+
+.source-item-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
 }
 
 .source-item .source-score {
@@ -589,6 +596,64 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.source-chunks-toggle {
+  background: none;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  transition: background var(--transition);
+}
+
+.source-chunks-toggle:hover {
+  background: var(--color-border);
+  color: var(--color-text);
+}
+
+.source-chunks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--color-border);
+  padding-top: 6px;
+  animation: msgFadeIn 0.2s ease;
+}
+
+.source-chunk {
+  background: var(--color-bg);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+}
+
+.source-chunk-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  margin-bottom: 4px;
+}
+
+.source-chunk-score {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.source-chunk-content {
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 150px;
+  overflow-y: auto;
 }
 
 /* Typing indicator */
@@ -1612,4 +1677,277 @@ body {
   .message {
     max-width: 95%;
   }
+}
+
+/* ================================================================
+   登录页样式
+   ================================================================ */
+
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  width: 100%;
+  background: linear-gradient(135deg, var(--color-primary-bg) 0%, var(--color-bg) 100%);
+}
+
+.login-card {
+  width: 380px;
+  max-width: 90%;
+  padding: 40px 36px;
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+}
+
+.login-logo {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+.login-title {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 6px;
+}
+
+.login-subtitle {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+  margin-bottom: 28px;
+}
+
+.login-field {
+  text-align: left;
+  margin-bottom: 18px;
+}
+
+.login-field label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-bottom: 6px;
+}
+
+.login-field input {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  font-size: 14px;
+  color: var(--color-text);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.login-field input:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-light);
+}
+
+.login-error {
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--color-danger);
+  background: var(--color-danger-light);
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  text-align: left;
+}
+
+.login-button {
+  width: 100%;
+  height: 44px;
+  margin-top: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--color-primary);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition);
+}
+
+.login-button:hover:not(:disabled) {
+  background: var(--color-primary-dark);
+}
+
+.login-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.login-tip {
+  margin-top: 20px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  .login-page {
+    background: linear-gradient(135deg, rgba(37, 99, 235, 0.15) 0%, var(--color-bg) 100%);
+  }
+  .login-field input {
+    background: var(--color-sidebar);
+  }
+}
+
+/* ---- 退出登录按钮 ---- */
+
+.logout-button {
+  margin-left: 12px;
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.logout-button:hover {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+  background: var(--color-danger-light);
+}
+
+/* ============================================================
+   用户管理弹窗
+   ============================================================ */
+.user-modal {
+  max-width: 560px;
+  max-height: 80vh;
+}
+
+.user-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  margin-bottom: 12px;
+  background: var(--color-sidebar);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.form-field label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.form-field input {
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: 13px;
+}
+
+.form-field input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.form-checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.form-checkbox label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.form-error {
+  color: var(--color-danger);
+  font-size: 12px;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.user-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
+.user-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--color-sidebar);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+}
+
+.user-item-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.user-item-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.user-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--color-primary);
+  color: #fff;
+  font-weight: 500;
+}
+
+.user-item-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}
+
+/* 消息过期提示 */
+.message-stale-hint {
+  margin-top: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--color-warning);
+  background: var(--color-warning);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-warning);
+  color: #fff;
 }

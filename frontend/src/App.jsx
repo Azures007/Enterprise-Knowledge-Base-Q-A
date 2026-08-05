@@ -1,14 +1,27 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import Sidebar from './components/Sidebar'
 import ChatArea from './components/ChatArea'
-import { checkHealth, getCollections } from './services/api'
+import LoginPage from './components/LoginPage'
+import UserManagementModal from './components/UserManagementModal'
+import ChangePasswordModal from './components/ChangePasswordModal'
 import {
+  checkHealth,
+  getCollections,
   getConversations,
   createConversation,
   getConversationMessages,
+  isLoggedIn,
+  isAdmin,
+  clearToken,
+  setUnauthorizedHandler,
 } from './services/api'
 
 export default function App() {
+  // 认证
+  const [authed, setAuthed] = useState(isLoggedIn())
+  const [showUserModal, setShowUserModal] = useState(false)
+  const [showPwdModal, setShowPwdModal] = useState(false)
+
   // 知识库
   const [collections, setCollections] = useState([])
   const [selectedCollection, setSelectedCollection] = useState(null)
@@ -23,11 +36,18 @@ export default function App() {
   const initRef = useRef(false)
   const creatingRef = useRef(false)
 
+  // 注册 401 处理：token 失效时回到登录页
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setAuthed(false)
+    })
+  }, [])
+
   // ================================================================
-  // 初始化
+  // 初始化（登录成功后执行）
   // ================================================================
   useEffect(() => {
-    if (initRef.current) return
+    if (!authed || initRef.current) return
     initRef.current = true
 
     async function init() {
@@ -41,11 +61,31 @@ export default function App() {
         // 加载对话列表
         await loadConversations()
       } catch (err) {
-        setServerOnline(false)
-        setError(`无法连接到后端服务: ${err.message}`)
+        // 401 时 setUnauthorizedHandler 会登出；其余错误标记离线
+        if (!err._unauthorized) {
+          setServerOnline(false)
+          setError(`无法连接到后端服务: ${err.message}`)
+        }
       }
     }
     init()
+  }, [authed])
+
+  // 登出
+  const handleLogout = useCallback(() => {
+    clearToken()
+    setAuthed(false)
+    // 清空主界面状态
+    setCollections([])
+    setConversations([])
+    setCurrentConvId(null)
+    setMessages([])
+    initRef.current = false
+  }, [])
+
+  // 登录成功
+  const handleLogin = useCallback(() => {
+    setAuthed(true)
   }, [])
 
   // ================================================================
@@ -162,6 +202,11 @@ export default function App() {
     refreshKBInfo()
   }, [refreshKBInfo])
 
+  // 未登录：显示登录页
+  if (!authed) {
+    return <LoginPage onLogin={handleLogin} />
+  }
+
   return (
     <div className="app">
       <header className="app-header">
@@ -174,8 +219,27 @@ export default function App() {
           <span className="status-text">
             {serverOnline ? '服务正常' : '服务离线'}
           </span>
+          {isAdmin() && (
+            <button className="logout-button" onClick={() => setShowUserModal(true)} title="用户管理">
+              👥 用户
+            </button>
+          )}
+          <button className="logout-button" onClick={() => setShowPwdModal(true)} title="修改密码">
+            🔑 改密码
+          </button>
+          <button className="logout-button" onClick={handleLogout} title="退出登录">
+            退出
+          </button>
         </div>
       </header>
+
+      {showUserModal && (
+        <UserManagementModal onClose={() => setShowUserModal(false)} />
+      )}
+
+      {showPwdModal && (
+        <ChangePasswordModal onClose={() => setShowPwdModal(false)} />
+      )}
 
       <div className="app-body">
         <Sidebar
@@ -183,6 +247,7 @@ export default function App() {
           conversations={conversations}
           currentConvId={currentConvId}
           serverOnline={serverOnline}
+          isAdmin={isAdmin()}
           onUploadSuccess={handleUploadSuccess}
           onClearMessages={clearMessages}
           onRefresh={refreshKBInfo}

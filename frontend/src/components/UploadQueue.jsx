@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react'
-import { uploadDocument } from '../services/api'
+import { uploadDocument, uploadDocumentAsync, getIngestTaskStatus, ASYNC_INGEST_THRESHOLD } from '../services/api'
 
 const MAX_CONCURRENT = 3  // 最大并发上传数
 
@@ -82,6 +82,43 @@ export default function UploadQueue({ uploadCollection, onUploadSuccess, serverO
     updateTask(task.id, { status: 'uploading', progress: 0 })
 
     try {
+      // 大文件（>10MB）走异步导入：先上传拿 task_id，再轮询后台解析进度
+      if (task.file.size > ASYNC_INGEST_THRESHOLD) {
+        const res = await uploadDocumentAsync(
+          task.file,
+          (progress) => updateTask(task.id, { progress }),
+          null,
+          uploadCollection,
+        )
+
+        const taskId = res.data?.task_id
+        if (!taskId) {
+          throw new Error('异步上传未返回任务 ID')
+        }
+
+        // 上传完成（网络传输 100%），进入后台解析阶段
+        updateTask(task.id, { progress: 100, asyncTaskId: taskId })
+
+        // 轮询后台任务状态
+        const taskResult = await pollAsyncTask(taskId)
+        if (taskResult.status === 'failed') {
+          updateTask(task.id, {
+            status: 'error',
+            error: { type: 'ingest_failed', message: taskResult.error_msg || '文档导入失败' },
+          })
+          return
+        }
+        updateTask(task.id, {
+          status: 'done',
+          progress: 100,
+          result: { chunks_added: taskResult.chunks_added || 0 },
+          targetCollection: uploadCollection || '个人知识库',
+        })
+        onUploadSuccess?.()
+        return
+      }
+
+      // 小文件：传统同步上传
       const result = await uploadDocument(
         task.file,
         (progress) => updateTask(task.id, { progress }),
@@ -94,6 +131,7 @@ export default function UploadQueue({ uploadCollection, onUploadSuccess, serverO
         status: 'done',
         progress: 100,
         result: result.data,
+        targetCollection: uploadCollection || '个人知识库',
         warning: warnings?.length > 0 ? warnings : null,
       })
       onUploadSuccess?.()
@@ -105,6 +143,24 @@ export default function UploadQueue({ uploadCollection, onUploadSuccess, serverO
       })
     }
   }
+
+  // 轮询异步导入任务状态
+  const pollAsyncTask = useCallback(async (taskId, maxTries = 120) => {
+    for (let i = 0; i < maxTries; i++) {
+      await new Promise((r) => setTimeout(r, 2000))  // 每 2 秒轮询一次
+      try {
+        const res = await getIngestTaskStatus(taskId)
+        const task = res.data
+        if (task.status === 'success' || task.status === 'failed') {
+          return task
+        }
+      } catch (err) {
+        // 轮询失败继续尝试
+        console.warn('轮询任务状态失败:', err.message)
+      }
+    }
+    return { status: 'failed', error_msg: '任务超时' }
+  }, [])
 
   // 拖拽事件
   const handleDrop = useCallback((e) => {
@@ -139,13 +195,18 @@ export default function UploadQueue({ uploadCollection, onUploadSuccess, serverO
   const statusText = (task) => {
     if (task.status === 'done') {
       const chunks = task.result?.chunks_added ?? 0
-      return `导入成功 (${chunks} 块)`
+      const coll = task.targetCollection
+      return coll ? `导入成功 (${chunks} 块 → ${coll})` : `导入成功 (${chunks} 块)`
     }
     if (task.status === 'error') {
       return task.error?.message || '上传失败'
     }
     if (task.status === 'waiting') return '等待上传'
-    if (task.status === 'uploading') return `上传中 ${task.progress}%`
+    if (task.status === 'uploading') {
+      // 大文件：网络上传完成后进入后台解析阶段
+      if (task.asyncTaskId && task.progress >= 100) return '后台解析中...'
+      return `上传中 ${task.progress}%`
+    }
     return ''
   }
 

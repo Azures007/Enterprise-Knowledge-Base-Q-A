@@ -5,13 +5,17 @@ API 路由模块
 提供 RESTful API 接口，供前端或其他服务调用知识库问答功能。
 
 接口列表:
-    POST   /api/query            - 知识库问答
-    POST   /api/query/stream     - 知识库问答（流式 SSE）
+    POST   /api/auth/login       - 登录获取 JWT 令牌
+    POST   /api/query            - 知识库问答（支持多轮对话）
+    POST   /api/query/stream     - 知识库问答（流式 SSE，支持多轮对话）
     POST   /api/ingest           - 上传并导入文档
     GET    /api/collections      - 查看知识库集合列表
     GET    /api/stats            - 查看知识库统计信息
     DELETE /api/collections/{name} - 删除指定集合
     GET    /api/health           - 健康检查
+
+认证: AUTH_ENABLED=true 时，除 /api/auth/login 与 /api/health 外，
+      所有接口需携带 Authorization: Bearer <token> 或 X-API-Key: <key>
 =============================================================================
 
 使用方法（启动服务）:
@@ -30,6 +34,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
 )
 from fastapi.responses import StreamingResponse
@@ -41,17 +46,24 @@ from src.utils.logger import setup_logger
 from config.settings import settings
 
 from src.conversations import ConversationManager, PGConversationManager
+from src.auth import create_token, require_auth
+from src.user_scope import user_personal_collection, is_admin_user, visible_collections
 
 from .models import (
     AddMessageRequest,
     APIResponse,
     BatchDeleteConversationsRequest,
+    ChangePasswordRequest,
     CreateCollectionRequest,
+    CreateUserRequest,
     IngestConfirmRequest,
+    LoginRequest,
+    LoginResponseData,
     QueryRequest,
     QueryResponseData,
     QueryStats,
     RenameCollectionRequest,
+    ResetPasswordRequest,
     SourceInfo,
     StreamQueryRequest,
     UpdateConversationTitleRequest,
@@ -61,51 +73,144 @@ from .models import (
 logger = setup_logger(__name__)
 
 # ==============================================================================
-# 依赖注入：确保在整个 API 生命周期中复用同一实例
+# 依赖注入
 # ==============================================================================
+# 单例通过 request.app.state 持有（FastAPI lifespan 中创建），
+# 避免模块级全局变量在多 worker 下的竞态问题。
 
-_rag_pipeline: RAGPipeline | None = None
-_document_loader: DocumentLoader | None = None
-_text_chunker: TextChunker | None = None
-_conversation_mgr: Any | None = None
-
-
-def get_rag_pipeline() -> RAGPipeline:
-    """获取或创建 RAG 管线单例"""
-    global _rag_pipeline
-    if _rag_pipeline is None:
-        _rag_pipeline = RAGPipeline()
-    return _rag_pipeline
+def get_rag_pipeline(request: Request) -> RAGPipeline:
+    """获取 RAG 管线单例（来自 app.state）"""
+    return request.app.state.rag_pipeline
 
 
-def get_document_loader() -> DocumentLoader:
-    """获取文档加载器单例"""
-    global _document_loader
-    if _document_loader is None:
-        _document_loader = DocumentLoader()
-    return _document_loader
+def get_document_loader(request: Request) -> DocumentLoader:
+    """获取文档加载器单例（来自 app.state）"""
+    return request.app.state.document_loader
 
 
-def get_text_chunker() -> TextChunker:
-    """获取文本分块器单例"""
-    global _text_chunker
-    if _text_chunker is None:
-        _text_chunker = TextChunker()
-    return _text_chunker
+def get_text_chunker(request: Request) -> TextChunker:
+    """获取文本分块器单例（来自 app.state）"""
+    return request.app.state.text_chunker
 
 
-def get_conversation_mgr() -> PGConversationManager:
-    """获取对话管理器单例（优先复用 RAG 管线的 PGVectorStore）"""
-    global _conversation_mgr
-    if _conversation_mgr is None:
-        from src.conversations import PGConversationManager
-        rag = get_rag_pipeline()
-        # 仅当 RAG 管线使用 PGVectorStore 时复用，否则创建独立实例
-        if hasattr(rag.vector_store, "add_message"):
-            _conversation_mgr = PGConversationManager(vector_store=rag.vector_store)
-        else:
-            _conversation_mgr = PGConversationManager()
-    return _conversation_mgr
+def get_conversation_mgr(request: Request) -> PGConversationManager:
+    """获取对话管理器单例（来自 app.state）"""
+    return request.app.state.conversation_mgr
+
+
+async def _resolve_user_id(mgr: PGConversationManager, auth: dict) -> int | None:
+    """
+    从认证信息解析用户 ID，用于对话归属过滤。
+
+    - 认证开启且为 JWT 用户 → 返回数据库用户 ID
+    - 认证关闭（anonymous）或 API Key → 返回 None（不过滤，保持兼容）
+    """
+    username = auth.get("username")
+    if not username or username == "anonymous":
+        return None
+    try:
+        return await mgr.aget_user_id(username)
+    except Exception:
+        return None
+
+
+# 多轮对话历史 token 预算（字符估算，约为 token 数 × 2）
+HISTORY_TOKEN_BUDGET = 4000
+# 每个历史消息的 token 估算（字符数 → token，中文约 1 字符 ≈ 0.6 token）
+_CHARS_PER_TOKEN = 1.6
+
+
+def _trim_history_by_budget(history: list[dict], budget: int = HISTORY_TOKEN_BUDGET) -> list[dict]:
+    """
+    按 token 预算动态截断历史消息，从旧到新丢弃，确保总长度不超过预算。
+
+    保留尽量多的最近消息（多轮上下文），超出预算时优先丢弃最早的。
+    """
+    if not history:
+        return history
+    total_chars = sum(len(m.get("content", "")) for m in history)
+    if total_chars / _CHARS_PER_TOKEN <= budget:
+        return history
+    # 从旧到新逐条丢弃，直到不超预算
+    trimmed = list(history)
+    for _ in range(len(history)):
+        total_chars = sum(len(m.get("content", "")) for m in trimmed)
+        if total_chars / _CHARS_PER_TOKEN <= budget:
+            break
+        trimmed.pop(0)  # 丢弃最早的一条
+    return trimmed
+
+
+async def _load_conversation_history(mgr, conversation_id, user_id) -> list[dict]:
+    """
+    加载对话历史并应用 token 预算截断。
+
+    Returns:
+        格式化的历史消息列表 [{"role": "user"|"assistant", "content": "..."}]
+    """
+    if conversation_id is None:
+        return []
+    try:
+        messages = await mgr.aget_messages(conversation_id, user_id=user_id)
+        history = [
+            {"role": "assistant" if m["role"] == "ai" else "user", "content": m["content"]}
+            for m in messages
+        ]
+        return _trim_history_by_budget(history)
+    except Exception as e:
+        logger.warning(f"加载对话历史失败: {e}")
+        return []
+
+
+async def _resolve_user_id_for_collections(rag, auth: dict) -> int | None:
+    """从认证信息解析用户 ID，用于集合归属判断。"""
+    username = auth.get("username")
+    if not username or username == "anonymous":
+        return None
+    try:
+        user = await rag.vector_store.aget_user_by_username(username)
+        return user["id"] if user else None
+    except Exception:
+        return None
+
+
+async def _collection_owner_map(rag) -> dict[str, int | None]:
+    """构建 集合名 → owner_id 的映射。"""
+    rows = await rag.vector_store.alist_collections_with_owner()
+    return {r["name"]: r["owner_id"] for r in rows}
+
+
+async def _visible_collections_for(rag, auth: dict) -> list[str]:
+    """获取当前用户可见的集合名列表（含归属过滤）。"""
+    all_raw = await rag.vector_store.alist_collections()
+    owner_map = await _collection_owner_map(rag)
+    user_id = await _resolve_user_id_for_collections(rag, auth)
+    return visible_collections(auth, all_raw, user_id=user_id, owner_map=owner_map)
+
+
+async def _resolve_upload_collection(rag, auth: dict, requested: str | None) -> str:
+    """
+    解析上传文档的目标集合。
+
+    - 管理员：可指定任意集合；未指定 → 个人集合（知识库）
+    - 普通用户：指定的集合必须是自己可见的（个人集合或自建集合），否则回退个人集合
+    - 未指定：回退个人集合
+    """
+    username = auth.get("username", "anonymous")
+    personal = user_personal_collection(username)
+
+    if not requested:
+        return personal
+
+    if is_admin_user(auth):
+        return requested
+
+    # 普通用户：仅当请求的集合自己可见时才使用，否则回退个人集合
+    visible = await _visible_collections_for(rag, auth)
+    if requested in visible:
+        return requested
+    logger.info(f"用户 {username} 尝试上传到无权集合 '{requested}'，回退个人集合 '{personal}'")
+    return personal
 
 
 # ==============================================================================
@@ -115,11 +220,197 @@ def get_conversation_mgr() -> PGConversationManager:
 router = APIRouter(prefix="/api", tags=["知识库问答"])
 
 
+# ==============================================================================
+# 认证
+# ==============================================================================
+
+@router.post("/auth/login", summary="登录获取 JWT 令牌", response_model=APIResponse)
+async def login(
+    body: LoginRequest,
+    request: Request,
+):
+    """
+    使用用户名密码登录，获取 JWT 令牌。
+
+    令牌放入请求头 `Authorization: Bearer <token>`。
+    admin 账号在服务启动时自动创建（用户名/密码来自 AUTH_ADMIN_* 配置）。
+    """
+    user_manager = request.app.state.user_manager
+    user = await user_manager.authenticate(body.username, body.password)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="用户名或密码错误",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_token(user["username"])
+    return APIResponse(
+        code=0,
+        message="success",
+        data=LoginResponseData(
+            token=token,
+            token_type="bearer",
+            expires_in=settings.JWT_EXPIRE_MINUTES * 60,
+            username=user["username"],
+            is_admin=bool(user.get("is_admin", False)),
+        ),
+    )
+
+
+# ---------------------------------------------------------------
+# 用户管理（仅管理员）
+# ---------------------------------------------------------------
+
+@router.get("/users", summary="获取用户列表（管理员）")
+async def list_users(
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
+    """获取所有用户列表（仅管理员）。"""
+    if not settings.AUTH_ENABLED:
+        pass  # 认证关闭：不做限制
+    else:
+        username = auth.get("username")
+        if not username or username == "anonymous":
+            raise HTTPException(status_code=401, detail="需要登录")
+        um = request.app.state.user_manager
+        user = await um._store.aget_user_by_username(username)
+        if user is None or not user["is_admin"]:
+            raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+
+    um = request.app.state.user_manager
+    users = await um.list_users()
+    return {"code": 0, "message": "success", "data": users}
+
+
+@router.post("/users", summary="创建用户（管理员）")
+async def create_user(
+    body: CreateUserRequest,
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
+    """创建新用户（仅管理员）。"""
+    if settings.AUTH_ENABLED:
+        username = auth.get("username")
+        if not username or username == "anonymous":
+            raise HTTPException(status_code=401, detail="需要登录")
+        um = request.app.state.user_manager
+        admin = await um._store.aget_user_by_username(username)
+        if admin is None or not admin["is_admin"]:
+            raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+
+    um = request.app.state.user_manager
+    try:
+        user = await um.create_user(
+            username=body.username,
+            password=body.password,
+            display_name=body.display_name,
+            is_admin=body.is_admin,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"创建用户失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"创建用户失败: {e}")
+
+    return {"code": 0, "message": "success", "data": user}
+
+
+@router.delete("/users/{user_id}", summary="删除用户（管理员）")
+async def delete_user(
+    user_id: int,
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
+    """删除用户及其所有对话（仅管理员）。"""
+    if settings.AUTH_ENABLED:
+        username = auth.get("username")
+        if not username or username == "anonymous":
+            raise HTTPException(status_code=401, detail="需要登录")
+        um = request.app.state.user_manager
+        admin = await um._store.aget_user_by_username(username)
+        if admin is None or not admin["is_admin"]:
+            raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+        # 防止删除自己
+        if admin["id"] == user_id:
+            raise HTTPException(status_code=400, detail="不能删除当前登录的管理员账号")
+
+    um = request.app.state.user_manager
+    ok = await um.delete_user(user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"code": 0, "message": "用户已删除", "data": {}}
+
+
+# ---------------------------------------------------------------
+# 修改密码
+# ---------------------------------------------------------------
+
+@router.post("/auth/change-password", summary="修改自己的密码")
+async def change_password(
+    body: ChangePasswordRequest,
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
+    """当前登录用户修改自己的密码。"""
+    username = auth.get("username")
+    if not username or username == "anonymous":
+        raise HTTPException(status_code=401, detail="需要登录")
+
+    um = request.app.state.user_manager
+    try:
+        ok = await um.change_password(
+            username=username,
+            old_password=body.old_password,
+            new_password=body.new_password,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not ok:
+        raise HTTPException(status_code=400, detail="原密码错误")
+    return {"code": 0, "message": "密码已修改", "data": {}}
+
+
+@router.post("/users/{user_id}/reset-password", summary="管理员重置用户密码")
+async def reset_password(
+    user_id: int,
+    body: ResetPasswordRequest,
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
+    """管理员重置指定用户的密码。"""
+    if not settings.AUTH_ENABLED:
+        pass
+    else:
+        username = auth.get("username")
+        if not username or username == "anonymous":
+            raise HTTPException(status_code=401, detail="需要登录")
+        um = request.app.state.user_manager
+        admin = await um._store.aget_user_by_username(username)
+        if admin is None or not admin["is_admin"]:
+            raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+
+    um = request.app.state.user_manager
+    try:
+        ok = await um.reset_password(
+            admin_username=auth.get("username", "admin"),
+            target_user_id=user_id,
+            new_password=body.new_password,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"code": 0, "message": "密码已重置", "data": {}}
+
+
 # ---------------------------------------------------------------
 # 自动路由：根据问题判断最相关的集合
 # ---------------------------------------------------------------
 
-def _auto_route_collection(question: str, collections: list[str], rag) -> str | None:
+async def _auto_route_collection(question: str, collections: list[str], rag) -> str | None:
     """
     根据用户问题自动选择最相关的知识库集合。
 
@@ -142,7 +433,7 @@ def _auto_route_collection(question: str, collections: list[str], rag) -> str | 
 最相关的集合名称："""
 
     try:
-        answer = rag.llm.generate(
+        answer = await rag.llm.agenerate(
             prompt=prompt,
             system_prompt="你是一个知识库路由助手。分析用户问题，选择最匹配的集合名称，只返回名称本身。如果无法确定，返回「无法确定」。",
             max_tokens=50,
@@ -184,34 +475,77 @@ async def health_check():
 async def query_knowledge_base(
     body: QueryRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    mgr: PGConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
     """
     向知识库提问并获取回答。
 
-    collection: 可选，指定查询的集合名称。不传则自动路由到最相关的集合。
+    - collection: 可选，指定查询的集合名称。不传则自动路由到最相关的集合。
+    - conversation_id: 可选，传入对话 ID 后使用该对话历史进行多轮问答，
+      用户与 AI 的消息会自动写入该对话。
     """
     question = body.question.strip()
     k = body.k
     concise = body.concise
     filter_criteria = body.filter
     collection_name = body.collection
+    conversation_id = body.conversation_id
+    user_id = await _resolve_user_id(mgr, auth)
 
-    # ---- 自动路由：确定查询哪个集合 ----
-    all_collections = rag.vector_store.list_collections()
+    # ---- 加载多轮对话历史（按 token 预算动态截断） ----
+    history = await _load_conversation_history(mgr, conversation_id, user_id)
+
+    # ---- 自动路由：确定查询哪个集合（仅限当前用户可见集合） ----
+    all_collections = await _visible_collections_for(rag, auth)
+
+    # 知识库为空时，直接走 RAG 管线（其内部会使用通用知识回答并提示上传）
     if not all_collections:
-        # 没有集合，直接返回空
-        return APIResponse(
-            code=0,
-            message="success",
-            data=QueryResponseData(
+        try:
+            result = await rag.aquery(
                 question=question,
-                answer="当前知识库为空，请先上传文档。",
-                sources=[],
-                answer_type="general",
-                collection=None,
-                stats=QueryStats(retrieved_chunks=0, unique_sources=0),
-            ),
-        )
+                k=k,
+                stream=False,
+                concise=concise,
+                filter_criteria=filter_criteria,
+                history=history or None,
+            )
+            answer = result["answer"]
+            sources = [SourceInfo(**s) for s in result["sources"]]
+
+            # ---- 持久化对话（如传入 conversation_id） ----
+            if conversation_id is not None:
+                try:
+                    # 仅在用户有权限（对话归属当前用户或匿名共享）时写入
+                    owned_msgs = await mgr.aget_messages(conversation_id, user_id=user_id)
+                    if owned_msgs or user_id is None:
+                        await mgr.aadd_message(conversation_id, "user", question)
+                        await mgr.aadd_message(
+                            conversation_id, "ai", answer,
+                            sources=[s.model_dump() for s in sources],
+                            answer_type=result.get("answer_type", "general"),
+                        )
+                except Exception as e:
+                    logger.warning(f"持久化对话失败: {e}")
+
+            return APIResponse(
+                code=0,
+                message="success",
+                data=QueryResponseData(
+                    question=question,
+                    answer=answer,
+                    sources=sources,
+                    answer_type=result.get("answer_type", "general"),
+                    collection=None,
+                    stats=QueryStats(
+                        retrieved_chunks=len(result["context"]),
+                        unique_sources=len(result["sources"]),
+                    ),
+                ),
+            )
+        except Exception as e:
+            logger.error(f"问答接口异常: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"问答服务异常: {e}")
 
     if collection_name and collection_name in all_collections:
         # 用户指定了集合
@@ -221,7 +555,7 @@ async def query_knowledge_base(
         target_collection = all_collections[0]
     else:
         # 多个集合，自动路由
-        target_collection = _auto_route_collection(question, all_collections, rag)
+        target_collection = await _auto_route_collection(question, all_collections, rag)
 
     if target_collection is None:
         # 自动路由无法确定，提示用户手动选择
@@ -240,23 +574,39 @@ async def query_knowledge_base(
         )
 
     # 切换到目标集合
-    rag.vector_store.switch_collection(target_collection)
+    await rag.vector_store.aswitch_collection(target_collection)
 
     try:
-        result = rag.query(
+        result = await rag.aquery(
             question=question,
             k=k,
             stream=False,
             concise=concise,
             filter_criteria=filter_criteria,
+            history=history or None,
         )
+        answer = result["answer"]
+        sources = [SourceInfo(**s) for s in result["sources"]]
+
+        # ---- 持久化对话（如传入 conversation_id） ----
+        if conversation_id is not None:
+            try:
+                await mgr.aadd_message(conversation_id, "user", question)
+                await mgr.aadd_message(
+                    conversation_id, "ai", answer,
+                    sources=[s.model_dump() for s in sources],
+                    answer_type=result.get("answer_type", "general"),
+                )
+            except Exception as e:
+                logger.warning(f"持久化对话失败: {e}")
+
         return APIResponse(
             code=0,
             message="success",
             data=QueryResponseData(
                 question=question,
-                answer=result["answer"],
-                sources=[SourceInfo(**s) for s in result["sources"]],
+                answer=answer,
+                sources=sources,
                 answer_type=result.get("answer_type", "general"),
                 collection=target_collection,
                 stats=QueryStats(
@@ -278,29 +628,78 @@ async def query_knowledge_base(
 async def query_knowledge_base_stream(
     body: StreamQueryRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    mgr: PGConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
     """
     流式知识库问答，使用 Server-Sent Events (SSE) 协议。
+
+    - conversation_id: 可选，传入对话 ID 后使用该对话历史进行多轮问答。
     """
     question = body.question.strip()
     k = body.k
     concise = body.concise
     collection_name = body.collection
+    conversation_id = body.conversation_id
+    user_id = await _resolve_user_id(mgr, auth)
 
-    # ---- 自动路由：确定查询哪个集合 ----
-    all_collections = rag.vector_store.list_collections()
+    # ---- 加载多轮对话历史（按 token 预算动态截断） ----
+    history = await _load_conversation_history(mgr, conversation_id, user_id)
+
+    # ---- 自动路由：确定查询哪个集合（仅限当前用户可见集合） ----
+    all_collections = await _visible_collections_for(rag, auth)
+
+    # 知识库为空时，直接走 RAG 管线（其内部会使用通用知识回答并提示上传）
     if not all_collections:
-        async def empty_generator():
-            yield f"data: {json.dumps({'type': 'meta', 'sources': [], 'answer_type': 'general'}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'data': '当前知识库为空，请先上传文档。'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(empty_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        async def empty_kb_generator():
+            """知识库为空时的 SSE 生成器：LLM 通用知识回答 + 上传提示"""
+            try:
+                result = await rag.astream_query(
+                    question=question,
+                    k=k,
+                    concise=concise,
+                    history=history or None,
+                )
+                sources = result["sources"]
+                answer_type = result.get("answer_type", "general")
+                answer_generator = result["answer"]
+
+                yield f"data: {json.dumps({'type': 'meta', 'sources': sources, 'answer_type': answer_type}, ensure_ascii=False)}\n\n"
+
+                full_answer = ""
+                async for text_chunk in answer_generator:
+                    if text_chunk:
+                        full_answer += text_chunk
+                        yield f"data: {json.dumps({'type': 'chunk', 'data': text_chunk}, ensure_ascii=False)}\n\n"
+
+                yield f"data: {json.dumps({'type': 'done', 'data': full_answer}, ensure_ascii=False)}\n\n"
+
+                # 持久化对话（如传入 conversation_id，仅在有权访问时写入）
+                if conversation_id is not None:
+                    try:
+                        owned_msgs = await mgr.aget_messages(conversation_id, user_id=user_id)
+                        if owned_msgs or user_id is None:
+                            await mgr.aadd_message(conversation_id, "user", question)
+                            await mgr.aadd_message(
+                                conversation_id, "ai", full_answer,
+                                sources=sources,
+                                answer_type=answer_type,
+                            )
+                    except Exception as e:
+                        logger.warning(f"持久化对话失败: {e}")
+
+            except Exception as e:
+                logger.error(f"流式问答异常: {e}", exc_info=True)
+                yield f"data: {json.dumps({'type': 'error', 'data': str(e)}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(empty_kb_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     if collection_name and collection_name in all_collections:
         target_collection = collection_name
     elif len(all_collections) == 1:
         target_collection = all_collections[0]
     else:
-        target_collection = _auto_route_collection(question, all_collections, rag)
+        target_collection = await _auto_route_collection(question, all_collections, rag)
 
     if target_collection is None:
         coll_list = "、".join(all_collections)
@@ -310,15 +709,16 @@ async def query_knowledge_base_stream(
         return StreamingResponse(routing_failed_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     # 切换到目标集合
-    rag.vector_store.switch_collection(target_collection)
+    await rag.vector_store.aswitch_collection(target_collection)
 
     async def event_generator():
         """SSE 事件生成器"""
         try:
-            result = rag.stream_query(
+            result = await rag.astream_query(
                 question=question,
                 k=k,
                 concise=concise,
+                history=history or None,
             )
             sources = result["sources"]
             answer_type = result.get("answer_type", "general")
@@ -329,13 +729,27 @@ async def query_knowledge_base_stream(
 
             # 流式发送回答片段
             full_answer = ""
-            for text_chunk in answer_generator:
+            async for text_chunk in answer_generator:
                 if text_chunk:
                     full_answer += text_chunk
                     yield f"data: {json.dumps({'type': 'chunk', 'data': text_chunk}, ensure_ascii=False)}\n\n"
 
             # 发送完成信号
             yield f"data: {json.dumps({'type': 'done', 'data': full_answer}, ensure_ascii=False)}\n\n"
+
+            # ---- 持久化对话（如传入 conversation_id，仅在有权访问时写入） ----
+            if conversation_id is not None:
+                try:
+                    owned_msgs = await mgr.aget_messages(conversation_id, user_id=user_id)
+                    if owned_msgs or user_id is None:
+                        await mgr.aadd_message(conversation_id, "user", question)
+                        await mgr.aadd_message(
+                            conversation_id, "ai", full_answer,
+                            sources=sources,
+                            answer_type=answer_type,
+                        )
+                except Exception as e:
+                    logger.warning(f"持久化对话失败: {e}")
 
         except Exception as e:
             logger.error(f"流式问答异常: {e}", exc_info=True)
@@ -360,9 +774,12 @@ async def query_knowledge_base_stream(
 async def get_upload_token(
     filename: str = Query(..., description="文件名"),
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
     """
     获取 OSS 直传的预签名 URL，前端直接上传到 OSS 后可获得真实进度。
+
+    需要登录认证；签名仅对当前登录用户有效。
 
     使用流程：
         1. 前端调用此接口获取 upload_url
@@ -397,17 +814,20 @@ async def confirm_upload(
     rag: RAGPipeline = Depends(get_rag_pipeline),
     loader: DocumentLoader = Depends(get_document_loader),
     chunker: TextChunker = Depends(get_text_chunker),
+    auth: dict = Depends(require_auth),
 ):
     """
     确认 OSS 直传完成，从 OSS 下载文件并导入知识库。
+
+    文档归入当前用户的个人集合；管理员可指定任意集合。
     """
     object_key = body.object_key.strip()
     filename = (body.filename or "").strip() or object_key.split("/")[-1]
     collection_name = body.collection
 
-    # 切换到目标集合
-    if collection_name:
-        rag.vector_store.switch_collection(collection_name)
+    # 切换到目标集合：管理员可指定任意集合，普通用户仅能传到自己可见的集合
+    target_collection = await _resolve_upload_collection(rag, auth, collection_name)
+    await rag.vector_store.aswitch_collection(target_collection)
 
     # 从 OSS 下载文件
     from src.storage import get_storage, OSSStorage
@@ -440,17 +860,34 @@ async def confirm_upload(
         content_hash = hashlib.sha256(content).hexdigest()
 
         # 查重（内容相同）
-        existing = rag.vector_store.find_document_by_hash(content_hash)
+        existing = await rag.vector_store.afind_document_by_hash(content_hash)
         if existing is not None:
-            os.unlink(tmp_path)
-            raise HTTPException(status_code=409, detail={
-                "error_type": "duplicate_document",
-                "message": f"文件 '{filename}' 与已存在的文档内容重复",
-                "suggestion": f"该文档已在 {existing['created_at'][:10]} 导入过",
-            })
+            try:
+                existing_chunks = await rag.vector_store.acount_document_chunks(existing["id"])
+            except AttributeError:
+                existing_chunks = 1
+                logger.warning("acount_document_chunks 不可用，按正常重复处理")
+
+            if existing_chunks > 0:
+                os.unlink(tmp_path)
+                raise HTTPException(status_code=409, detail={
+                    "error_type": "duplicate_document",
+                    "message": f"文件 '{filename}' 与已存在的文档内容重复",
+                    "suggestion": f"该文档已在 {existing['created_at'][:10]} 导入过",
+                })
+            else:
+                # 僵尸记录：无分块内容，清理后继续本次导入
+                logger.warning(
+                    f"检测到僵尸文档记录 id={existing['id']}（{existing['filename']}）"
+                    f"无分块内容，自动清理后重新导入"
+                )
+                try:
+                    await rag.vector_store.adelete_document(existing["id"], delete_storage=True)
+                except Exception as e:
+                    logger.warning(f"清理僵尸记录失败（继续导入）: {e}")
 
         # 查重（文件名相同）
-        existing_name = rag.vector_store.find_document_by_filename(filename)
+        existing_name = await rag.vector_store.afind_document_by_filename(filename)
         if existing_name is not None:
             os.unlink(tmp_path)
             raise HTTPException(status_code=409, detail={
@@ -477,7 +914,7 @@ async def confirm_upload(
 
         # 记录文件元数据
         try:
-            doc_id = rag.vector_store.add_document_record(
+            doc_id = await rag.vector_store.aadd_document_record(
                 filename=filename,
                 file_type=file_ext.lstrip("."),
                 file_size=file_size,
@@ -491,7 +928,7 @@ async def confirm_upload(
 
         # 分块和导入
         chunked_docs = chunker.split_documents(raw_docs)
-        count = rag.vector_store.add_documents(chunked_docs, document_id=doc_id)
+        count = await rag.vector_store.aadd_documents(chunked_docs, document_id=doc_id)
 
         return {
             "code": 0,
@@ -523,9 +960,13 @@ async def ingest_document(
     rag: RAGPipeline = Depends(get_rag_pipeline),
     loader: DocumentLoader = Depends(get_document_loader),
     chunker: TextChunker = Depends(get_text_chunker),
+    auth: dict = Depends(require_auth),
 ):
     """
     上传文档文件并将其导入知识库。
+
+    文档归入当前用户的个人集合；管理员归入"知识库"集合。
+    collection 参数仅允许指定当前用户可见的集合，否则忽略并归入个人集合。
 
     支持的格式: pdf, docx, doc, docm, pptx, xlsx, xls,
                  jpg, jpeg, png, bmp, tiff, txt, md, json 等
@@ -608,23 +1049,42 @@ async def ingest_document(
         logger.info(f"内容哈希: {content_hash[:16]}...")
 
         try:
-            existing = rag.vector_store.find_document_by_hash(content_hash)
+            existing = await rag.vector_store.afind_document_by_hash(content_hash)
             logger.info(f"查重结果: {existing}")
         except AttributeError as e:
             logger.warning(f"查重方法不可用: {e}")
             existing = None
 
         if existing is not None:
-            os.unlink(tmp_path)
-            raise HTTPException(status_code=409, detail={
-                "error_type": "duplicate_document",
-                "message": f"文件 '{file.filename}' 与已存在的文档内容重复",
-                "suggestion": (
-                    f"该文档已在 {existing['created_at'][:10]} 导入过（"
-                    f"原文件名: {existing['filename']}，{existing['file_size']} bytes）。\n"
-                    f"如需重新导入，请先删除集合后重试。"
-                ),
-            })
+            # 检查该文档是否真的完成了分块入库
+            try:
+                existing_chunks = await rag.vector_store.acount_document_chunks(existing["id"])
+            except AttributeError:
+                existing_chunks = 1  # 无法判断时视为正常记录，走原有 409 逻辑
+                logger.warning("acount_document_chunks 不可用，按正常重复处理")
+
+            if existing_chunks > 0:
+                # 正常重复：文档已完整入库
+                os.unlink(tmp_path)
+                raise HTTPException(status_code=409, detail={
+                    "error_type": "duplicate_document",
+                    "message": f"文件 '{file.filename}' 与已存在的文档内容重复",
+                    "suggestion": (
+                        f"该文档已在 {existing['created_at'][:10]} 导入过（"
+                        f"原文件名: {existing['filename']}，{existing['file_size']} bytes）。\n"
+                        f"如需重新导入，请先删除集合后重试。"
+                    ),
+                })
+            else:
+                # 僵尸记录：只有元数据、无分块（上次导入中断），清理后继续本次导入
+                logger.warning(
+                    f"检测到僵尸文档记录 id={existing['id']}（{existing['filename']}）"
+                    f"无分块内容，自动清理后重新导入"
+                )
+                try:
+                    await rag.vector_store.adelete_document(existing["id"], delete_storage=True)
+                except Exception as e:
+                    logger.warning(f"清理僵尸记录失败（继续导入）: {e}")
 
         # ---- 检查文件名是否重复 ----
         # 确定最终使用的文件名（优先使用前端传的自定义文件名）
@@ -632,12 +1092,12 @@ async def ingest_document(
         if not final_filename:
             final_filename = file.filename
 
-        # 切换到目标集合
-        if collection:
-            rag.vector_store.switch_collection(collection)
+        # 切换到目标集合：管理员可指定任意集合，普通用户仅能传到自己可见的集合
+        target_collection = await _resolve_upload_collection(rag, auth, collection)
+        await rag.vector_store.aswitch_collection(target_collection)
 
         try:
-            existing_name = rag.vector_store.find_document_by_filename(final_filename)
+            existing_name = await rag.vector_store.afind_document_by_filename(final_filename)
         except AttributeError:
             existing_name = None
 
@@ -645,7 +1105,7 @@ async def ingest_document(
             logger.info(f"文件名 '{final_filename}' 已存在，执行覆盖更新 (旧文档 id={existing_name['id']})")
             old_doc_id = existing_name["id"]
             try:
-                rag.vector_store.delete_document(old_doc_id, delete_storage=True)
+                await rag.vector_store.adelete_document(old_doc_id, delete_storage=True)
                 logger.info(f"旧文档已删除 (id={old_doc_id})")
             except Exception as e:
                 logger.warning(f"删除旧文档失败（继续导入）: {e}")
@@ -683,7 +1143,7 @@ async def ingest_document(
 
         # 记录文件元数据到 PostgreSQL
         try:
-            doc_id = rag.vector_store.add_document_record(
+            doc_id = await rag.vector_store.aadd_document_record(
                 filename=final_filename,
                 file_type=file_ext.lstrip("."),
                 file_size=file_size,
@@ -706,10 +1166,16 @@ async def ingest_document(
         chunked_docs = chunker.split_documents(raw_docs)
 
         # 导入知识库（关联 OSS 文件 ID）
-        count = rag.vector_store.add_documents(
+        count = await rag.vector_store.aadd_documents(
             chunked_docs,
             document_id=doc_id,
         )
+
+        # 文档更新后，标记引用该文件的旧回答为已过期
+        try:
+            await rag.vector_store.amark_stale_by_filenames([final_filename])
+        except Exception as e:
+            logger.warning(f"标记历史回答过期失败: {e}")
 
         response_data = {
             "filename": file.filename,
@@ -767,6 +1233,111 @@ async def ingest_document(
 
 
 # ---------------------------------------------------------------
+# 异步文档导入（大文件任务队列）
+# ---------------------------------------------------------------
+
+@router.post("/ingest/async", summary="异步上传并导入大文档")
+async def ingest_document_async(
+    request: Request,
+    file: UploadFile = File(...),
+    filename: str = Form(None),
+    collection: str = Form(None),
+    loader: DocumentLoader = Depends(get_document_loader),
+    chunker: TextChunker = Depends(get_text_chunker),
+    auth: dict = Depends(require_auth),
+):
+    """
+    异步上传大文档（>10MB），立即返回任务 ID，后台解析入库。
+
+    文档归入当前用户的个人集合；管理员可指定任意集合。
+
+    前端轮询 GET /api/ingest/tasks/{task_id} 获取进度。
+    小文件仍用同步的 POST /api/ingest。
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"error_type": "no_file", "message": "没有选择文件"})
+
+    # 检查扩展名
+    file_ext = Path(file.filename).suffix.lower()
+    if not file_ext:
+        raise HTTPException(status_code=400, detail={"error_type": "invalid_extension", "message": "文件没有扩展名"})
+
+    content = await file.read()
+    file_size = len(content)
+
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail={"error_type": "empty_file", "message": "文件为空"})
+
+    final_filename = (filename or file.filename).strip() or file.filename
+
+    # 目标集合：管理员可指定任意集合，普通用户仅能传到自己可见的集合
+    rag = get_rag_pipeline(request)
+    target_collection = await _resolve_upload_collection(rag, auth, collection)
+
+    task_mgr = request.app.state.ingest_task_mgr
+
+    # 提交异步任务
+    result = await task_mgr.submit(
+        filename=final_filename,
+        content=content,
+        collection=target_collection,
+        rag=rag,
+        loader=loader,
+        chunker=chunker,
+        store=rag.vector_store,
+    )
+
+    return {
+        "code": 0,
+        "message": "success",
+        "data": result,
+    }
+
+
+@router.get("/ingest/tasks/{task_id}", summary="查询异步导入任务状态")
+async def get_ingest_task(
+    task_id: str,
+    request: Request,
+    _: dict = Depends(require_auth),
+):
+    """
+    查询异步导入任务状态，供前端轮询。
+
+    状态: pending（排队）→ processing（处理中）→ success / failed
+    progress: 0~100
+    """
+    task_mgr = request.app.state.ingest_task_mgr
+    rag = get_rag_pipeline(request)
+
+    task = await task_mgr.get_status(task_id, rag.vector_store)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    return {
+        "code": 0,
+        "message": "success",
+        "data": task,
+    }
+
+
+@router.get("/ingest/tasks", summary="列出进行中的异步导入任务")
+async def list_ingest_tasks(
+    request: Request,
+    _: dict = Depends(require_auth),
+):
+    """列出所有进行中的异步导入任务。"""
+    task_mgr = request.app.state.ingest_task_mgr
+    rag = get_rag_pipeline(request)
+
+    tasks = await task_mgr.list_active(rag.vector_store)
+    return {
+        "code": 0,
+        "message": "success",
+        "data": tasks,
+    }
+
+
+# ---------------------------------------------------------------
 # 文档管理（删除）
 # ---------------------------------------------------------------
 
@@ -774,12 +1345,17 @@ async def ingest_document(
 async def list_documents(
     collection_name: str,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
-    """获取指定集合中的所有文档列表（含每个文档的分块数量）"""
+    """获取指定集合中的所有文档列表（仅限当前用户可见的集合）"""
     try:
-        rag.vector_store.switch_collection(collection_name)
-        docs = rag.vector_store.list_documents()
+        if collection_name not in await _visible_collections_for(rag, auth):
+            raise HTTPException(status_code=403, detail="无权访问该集合")
+        await rag.vector_store.aswitch_collection(collection_name)
+        docs = await rag.vector_store.alist_documents()
         return {"code": 0, "message": "success", "data": docs}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取文档列表异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取文档列表失败: {e}")
@@ -789,9 +1365,12 @@ async def list_documents(
 async def delete_document(
     doc_id: int,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
     """
     删除指定文档及其所有分块，同时删除 OSS/本地存储中的原始文件。
+
+    仅能删除当前用户可见集合内的文档（管理员可删全部）。
 
     删除内容：
         - PostgreSQL chunks 表中的关联分块
@@ -799,7 +1378,17 @@ async def delete_document(
         - OSS/本地存储中的原始文件
     """
     try:
-        result = rag.vector_store.delete_document(doc_id, delete_storage=True)
+        # 先校验文档归属的集合是否当前用户可见
+        doc = await rag.vector_store.afind_document_by_id(doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="文档不存在")
+        visible = await _visible_collections_for(rag, auth)
+        # 找到该文档所在集合
+        doc_collection = doc.get("collection_name")
+        if not is_admin_user(auth) and doc_collection not in visible:
+            raise HTTPException(status_code=403, detail="无权删除该文档")
+
+        result = await rag.vector_store.adelete_document(doc_id, delete_storage=True)
         if result is None:
             raise HTTPException(status_code=404, detail="文档不存在")
 
@@ -807,6 +1396,11 @@ async def delete_document(
         from src.cache import qa_cache
         if result.get("filename"):
             qa_cache.invalidate_by_tags([f"doc:{result['filename']}"])
+            # 标记引用该文档的历史回答为已过期
+            try:
+                await rag.vector_store.amark_stale_by_filenames([result["filename"]])
+            except Exception as e:
+                logger.warning(f"标记历史回答过期失败: {e}")
         else:
             qa_cache.clear()
 
@@ -833,9 +1427,19 @@ async def delete_document(
 @router.get("/stats", summary="查看知识库统计信息")
 async def get_stats(
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
-    """获取知识库详细统计信息"""
-    stats = rag.get_knowledge_base_stats()
+    """获取当前用户可见范围内的知识库统计信息（管理员为全局）"""
+    # 只统计用户可见集合（普通用户看不到全库数据，避免信息泄露）
+    visible = await _visible_collections_for(rag, auth)
+    total_chunks = 0
+    for name in visible:
+        await rag.vector_store.aswitch_collection(name)
+        total_chunks += await rag.vector_store.acount()
+
+    stats = await rag.aget_knowledge_base_stats()
+    stats["total_chunks"] = total_chunks
+    stats["collections"] = visible
     return {
         "code": 0,
         "message": "success",
@@ -846,17 +1450,18 @@ async def get_stats(
 @router.get("/collections", summary="查看知识库集合列表")
 async def list_collections(
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
-    """列出所有知识库集合及其文档数量"""
-    names = rag.vector_store.list_collections()
+    """列出当前用户可见的知识库集合及其文档数量（管理员可见全部）"""
+    names = await _visible_collections_for(rag, auth)
     # 获取每个集合的详细信息
     detailed = []
     for name in names:
-        rag.vector_store.switch_collection(name)
+        await rag.vector_store.aswitch_collection(name)
         detailed.append({
             "name": name,
-            "chunk_count": rag.vector_store.count(),
-            "document_count": len(rag.vector_store.list_documents()),
+            "chunk_count": await rag.vector_store.acount(),
+            "document_count": len(await rag.vector_store.alist_documents()),
         })
     return {
         "code": 0,
@@ -872,17 +1477,22 @@ async def list_collections(
 async def create_collection(
     body: CreateCollectionRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
-    """创建新的知识库集合"""
+    """创建新的知识库集合（所有用户可创建，归属当前用户）"""
     name = body.name.strip()
 
-    if name in rag.vector_store.list_collections():
+    if name in await rag.vector_store.alist_collections():
         raise HTTPException(status_code=409, detail=f"集合 '{name}' 已存在")
 
-    # 创建集合（切换过去即自动创建）
-    rag.vector_store.switch_collection(name)
-    # 切换回默认集合
-    rag.vector_store.switch_collection(settings.DEFAULT_COLLECTION)
+    # 归属：当前用户的 user_id（匿名/认证关闭时为 None，视为系统集合）
+    owner_id = await _resolve_user_id_for_collections(rag, auth)
+    # 创建集合（切换过去即自动创建），保持当前集合为目标集合
+    # 注意：不要在此处切回 DEFAULT_COLLECTION，否则会因 aswitch_collection
+    # 的"切换即按需建集合"行为，自动创建一个默认集合（如 knowledge_base）
+    await rag.vector_store.aswitch_collection(name)
+    # 若集合是新建的，补充 owner_id
+    await rag.vector_store.aset_collection_owner(name, owner_id)
 
     return {
         "code": 0,
@@ -896,14 +1506,19 @@ async def rename_collection(
     collection_name: str,
     body: RenameCollectionRequest,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
-    """重命名指定集合"""
+    """重命名指定集合（集合归属者或管理员）"""
+    owner_id = await _resolve_user_id_for_collections(rag, auth)
+    coll_owner = await rag.vector_store.aget_collection_owner(collection_name)
+    if not is_admin_user(auth) and coll_owner != owner_id:
+        raise HTTPException(status_code=403, detail="无权重命名该集合")
     new_name = body.name.strip()
 
-    if new_name in rag.vector_store.list_collections():
+    if new_name in await rag.vector_store.alist_collections():
         raise HTTPException(status_code=409, detail=f"集合 '{new_name}' 已存在")
 
-    ok = rag.vector_store.rename_collection(collection_name, new_name)
+    ok = await rag.vector_store.arenmae_collection(collection_name, new_name)
     if not ok:
         raise HTTPException(status_code=404, detail=f"集合 '{collection_name}' 不存在")
 
@@ -914,18 +1529,23 @@ async def rename_collection(
 async def delete_collection(
     collection_name: str,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
-    """删除指定的知识库集合（含所有文档块和 OSS 原文件）"""
+    """删除指定的知识库集合（含所有文档块和 OSS 原文件，集合归属者或管理员）"""
+    owner_id = await _resolve_user_id_for_collections(rag, auth)
+    coll_owner = await rag.vector_store.aget_collection_owner(collection_name)
+    if not is_admin_user(auth) and coll_owner != owner_id:
+        raise HTTPException(status_code=403, detail="无权删除该集合")
     try:
-        rag.vector_store.switch_collection(collection_name)
-        rag.vector_store.delete_collection()
+        await rag.vector_store.aswitch_collection(collection_name)
+        await rag.vector_store.adelete_collection()
         # 清空问答缓存
         from src.cache import qa_cache
         qa_cache.clear()
         # 切回一个存在的集合，防止 _ensure_collection 重建已删除的集合
-        remaining = rag.vector_store.list_collections()
+        remaining = await rag.vector_store.alist_collections()
         if remaining:
-            rag.vector_store.switch_collection(remaining[0])
+            await rag.vector_store.aswitch_collection(remaining[0])
         return {
             "code": 0,
             "message": f"集合 '{collection_name}' 已删除",
@@ -942,6 +1562,7 @@ async def get_collection_chunks(
     limit: int = 500,
     offset: int = 0,
     rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
 ):
     """
     获取指定集合中所有文档块的列表，包含文本内容和元数据。
@@ -955,9 +1576,12 @@ async def get_collection_chunks(
         每个文档块包含 id, content, metadata
     """
     try:
+        # 校验集合可见性
+        if collection_name not in await _visible_collections_for(rag, auth):
+            raise HTTPException(status_code=403, detail="无权访问该集合")
         # 切换到目标集合再读取
-        rag.vector_store.switch_collection(collection_name)
-        chunks = rag.get_collection_chunks(limit=limit, offset=offset)
+        await rag.vector_store.aswitch_collection(collection_name)
+        chunks = await rag.aget_collection_chunks(limit=limit, offset=offset)
 
         # 按源文件名分组
         grouped: dict[str, list] = {}
@@ -977,6 +1601,8 @@ async def get_collection_chunks(
                 "grouped": grouped,
             },
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取文档块列表异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取文档块列表失败: {e}")
@@ -989,10 +1615,12 @@ async def get_collection_chunks(
 @router.get("/conversations", summary="获取所有对话列表")
 async def list_conversations(
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """获取所有历史对话列表（按更新时间倒序）"""
+    """获取当前用户的历史对话列表（按更新时间倒序）"""
     try:
-        convs = mgr.list_conversations()
+        user_id = await _resolve_user_id(mgr, auth)
+        convs = await mgr.alist_conversations(user_id=user_id)
         return {"code": 0, "message": "success", "data": convs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取对话列表失败: {e}")
@@ -1001,10 +1629,12 @@ async def list_conversations(
 @router.post("/conversations", summary="创建新对话")
 async def create_conversation(
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """创建一个新的空对话"""
+    """创建一个新的空对话（归属当前用户）"""
     try:
-        conv = mgr.create_conversation()
+        user_id = await _resolve_user_id(mgr, auth)
+        conv = await mgr.acreate_conversation(user_id=user_id)
         return {"code": 0, "message": "success", "data": conv}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"创建对话失败: {e}")
@@ -1014,12 +1644,14 @@ async def create_conversation(
 async def batch_delete_conversations(
     body: BatchDeleteConversationsRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """批量删除指定对话（含所有消息）"""
+    """批量删除指定对话（仅能删除当前用户的对话）"""
     try:
+        user_id = await _resolve_user_id(mgr, auth)
         deleted = 0
         for conv_id in body.ids:
-            if mgr.delete_conversation(conv_id):
+            if await mgr.adelete_conversation(conv_id, user_id=user_id):
                 deleted += 1
 
         return {"code": 0, "message": f"成功删除 {deleted} 个对话", "data": {"deleted": deleted}}
@@ -1033,12 +1665,14 @@ async def batch_delete_conversations(
 async def delete_conversation(
     conv_id: int,
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """删除指定对话及其所有消息"""
+    """删除指定对话及其所有消息（仅能删除当前用户的对话）"""
     try:
-        ok = mgr.delete_conversation(conv_id)
+        user_id = await _resolve_user_id(mgr, auth)
+        ok = await mgr.adelete_conversation(conv_id, user_id=user_id)
         if not ok:
-            raise HTTPException(status_code=404, detail="对话不存在")
+            raise HTTPException(status_code=404, detail="对话不存在或无权操作")
         return {"code": 0, "message": "对话已删除", "data": {}}
     except HTTPException:
         raise
@@ -1051,12 +1685,14 @@ async def update_conversation_title(
     conv_id: int,
     body: UpdateConversationTitleRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """修改对话标题"""
+    """修改对话标题（仅能修改当前用户的对话）"""
     try:
-        ok = mgr.update_title(conv_id, body.title.strip())
+        user_id = await _resolve_user_id(mgr, auth)
+        ok = await mgr.aupdate_title(conv_id, body.title.strip(), user_id=user_id)
         if not ok:
-            raise HTTPException(status_code=404, detail="对话不存在")
+            raise HTTPException(status_code=404, detail="对话不存在或无权操作")
         return {"code": 0, "message": "success", "data": {}}
     except HTTPException:
         raise
@@ -1068,10 +1704,12 @@ async def update_conversation_title(
 async def get_messages(
     conv_id: int,
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """获取指定对话的所有消息"""
+    """获取指定对话的所有消息（仅能读取当前用户的对话）"""
     try:
-        messages = mgr.get_messages(conv_id)
+        user_id = await _resolve_user_id(mgr, auth)
+        messages = await mgr.aget_messages(conv_id, user_id=user_id)
         return {"code": 0, "message": "success", "data": messages}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取消息失败: {e}")
@@ -1082,10 +1720,12 @@ async def add_message(
     conv_id: int,
     body: AddMessageRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
-    """向对话中添加一条消息"""
+    """向对话中添加一条消息（仅能操作当前用户的对话）"""
     try:
-        msg_id = mgr.add_message(
+        user_id = await _resolve_user_id(mgr, auth)
+        msg_id = await mgr.aadd_message(
             conv_id,
             body.role,
             body.content,
@@ -1105,10 +1745,16 @@ async def update_message(
     msg_id: int,
     body: UpdateMessageRequest,
     mgr: ConversationManager = Depends(get_conversation_mgr),
+    auth: dict = Depends(require_auth),
 ):
     """更新消息内容（用于流式完成后补充完整内容和来源）"""
     try:
-        ok = mgr.update_message_content(msg_id, body.content, body.sources)
+        user_id = await _resolve_user_id(mgr, auth)
+        # 校验对话归属
+        msgs = await mgr.aget_messages(conv_id, user_id=user_id)
+        if not any(m["id"] == msg_id for m in msgs):
+            raise HTTPException(status_code=404, detail="消息不存在或无权操作")
+        ok = await mgr.aupdate_message_content(msg_id, body.content, body.sources)
         if not ok:
             raise HTTPException(status_code=404, detail="消息不存在")
         return {"code": 0, "message": "success", "data": {}}

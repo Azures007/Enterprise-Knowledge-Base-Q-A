@@ -78,7 +78,21 @@ class Settings(BaseSettings):
     # 检索配置
     # ================================================================
     RETRIEVAL_TOP_K: int = 5
-    """检索时返回的最相关文档块数量"""
+    """检索后最终返回的最相关文档块数量"""
+
+    RETRIEVAL_CANDIDATE_K: int = 20
+    """向量检索的候选块数量（重排前的粗召回，重排后取前 RETRIEVAL_TOP_K）"""
+
+    RERANK_ENABLED: bool = True
+    """是否启用重排。优先使用本地交叉编码器（bge-reranker），
+       依赖不可用时自动降级为关键词重合的轻量重排"""
+
+    RERANKER_TIMEOUT: int = 30
+    """交叉编码器模型加载超时（秒）。模型需从 Hugging Face 下载时，
+       超过该时间自动降级为轻量重排，避免阻塞应用启动"""
+
+    RERANKER_MODEL: str = "BAAI/bge-reranker-base"
+    """交叉编码器模型名（可选，安装 sentence-transformers 后生效）"""
 
     # ================================================================
     # 数据库配置（PostgreSQL + pgvector）
@@ -139,6 +153,39 @@ class Settings(BaseSettings):
 
     RATE_LIMIT_LLM_BURST: int = 16
     """百炼 API 令牌桶容量（突发峰值限制）"""
+
+    # ================================================================
+    # 认证配置（JWT + API Key）
+    # ================================================================
+    AUTH_ENABLED: bool = True
+    """是否启用 API 认证（默认开启；仅 /api/auth/login 与 /api/health 免认证）"""
+
+    JWT_SECRET_KEY: str = "change-me-in-production-please-use-a-random-32-byte-key"
+    """JWT 签名密钥（生产环境务必通过 .env 设置为随机字符串，建议 ≥32 字节）"""
+
+    JWT_ALGORITHM: str = "HS256"
+    """JWT 签名算法"""
+
+    JWT_EXPIRE_MINUTES: int = 60 * 24 * 7
+    """JWT 令牌有效期（分钟），默认 7 天"""
+
+    AUTH_ADMIN_USERNAME: str = "admin"
+    """管理员用户名（首次登录时创建）"""
+
+    AUTH_ADMIN_PASSWORD: str = "admin123"
+    """管理员密码（首次登录时创建，生产环境务必修改）"""
+
+    API_KEYS: str = ""
+    """静态 API Key 列表，逗号分隔（如: key1,key2），非空时可用 X-API-Key 头认证"""
+
+    # ================================================================
+    # 缓存配置
+    # ================================================================
+    CACHE_MAX_ENTRIES: int = 10000
+    """内存缓存最大条目数，超出后按 LRU 淘汰最久未使用的条目"""
+
+    CACHE_QA_TTL: int = 3600
+    """问答缓存 TTL（秒）"""
 
     # ================================================================
     # 日志配置

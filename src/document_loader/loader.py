@@ -183,24 +183,71 @@ class DocumentLoader:
         doc.close()
         return documents
 
+    # ================================================================
+    # .docx 解析（拆分为多个独立方法，提升可读性与可测试性）
+    # ================================================================
+
     @staticmethod
     def _load_docx(path, password=None):
+        """解析 .docx 文档，提取正文、页眉页脚、脚注尾注、批注、表格等内容。"""
         from docx import Document as DocxDocument
-        import zipfile
-        from xml.etree import ElementTree as ET
-        NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-        def _ns(tag):
-            return f"{{http://schemas.openxmlformats.org/wordprocessingml/2006/main}}{tag}"
-        def _extract_text(elem):
-            texts = []
-            for t in elem.iter(_ns("t")):
-                if t.text:
-                    texts.append(t.text)
-            return "".join(texts)
+
         try:
             doc = DocxDocument(str(path))
         except Exception as e:
             raise DocumentLoaderError(f"无法打开 docx 文件: {e}")
+
+        raw_xmls = DocumentLoader._read_docx_xmls(path)
+        warnings_list = []
+
+        all_text_parts = []
+        paragraphs_text = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        if paragraphs_text:
+            all_text_parts.append("[正文]")
+            all_text_parts.append("\n".join(paragraphs_text))
+
+        all_text_parts.extend(DocumentLoader._extract_docx_headers_footers(doc))
+        all_text_parts.extend(DocumentLoader._extract_docx_notes(raw_xmls))
+        all_text_parts.extend(DocumentLoader._extract_docx_comments(raw_xmls))
+        all_text_parts.extend(DocumentLoader._extract_docx_textboxes(raw_xmls))
+        all_text_parts.extend(DocumentLoader._extract_docx_revisions(raw_xmls))
+        all_text_parts.extend(DocumentLoader._extract_docx_tables(raw_xmls, doc))
+
+        # 检查嵌入对象
+        try:
+            import zipfile
+            with zipfile.ZipFile(str(path), "r") as z:
+                embedded = [n for n in z.namelist() if "embeddings" in n]
+                if embedded:
+                    warnings_list.append(
+                        f"文档包含 {len(embedded)} 个嵌入文件，嵌入内容无法提取，请单独上传"
+                    )
+        except Exception:
+            pass
+
+        full_text = "\n\n".join(all_text_parts) if all_text_parts else ""
+        if not full_text.strip():
+            warnings_list.append("文档中未提取到文本内容")
+
+        return [{
+            "page_content": full_text,
+            "metadata": {
+                "source": str(path), "filename": path.name,
+                "file_type": path.suffix.lower().lstrip("."),
+                "paragraphs": len(paragraphs_text),
+                "file_size": path.stat().st_size,
+                "warnings": warnings_list if warnings_list else None,
+            },
+        }]
+
+    # ----------------------------------------------------------
+    # .docx 辅助方法
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _read_docx_xmls(path) -> dict:
+        """读取 docx 包内所有 .xml 文件的原始字节，供深度解析使用。"""
+        import zipfile
         raw_xmls = {}
         try:
             with zipfile.ZipFile(str(path), "r") as z:
@@ -209,12 +256,26 @@ class DocumentLoader:
                         raw_xmls[name] = z.read(name)
         except Exception:
             pass
-        all_text_parts = []
-        warnings_list = []
-        paragraphs_text = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        if paragraphs_text:
-            all_text_parts.append("[正文]")
-            all_text_parts.append("\n".join(paragraphs_text))
+        return raw_xmls
+
+    @staticmethod
+    def _docx_ns(tag: str) -> str:
+        """将 WordprocessingML 简写标签转换为完整命名空间标签。"""
+        return f"{{http://schemas.openxmlformats.org/wordprocessingml/2006/main}}{tag}"
+
+    @staticmethod
+    def _docx_extract_text(elem) -> str:
+        """从 XML 元素中提取全部 w:t 文本。"""
+        texts = []
+        for t in elem.iter(DocumentLoader._docx_ns("t")):
+            if t.text:
+                texts.append(t.text)
+        return "".join(texts)
+
+    @staticmethod
+    def _extract_docx_headers_footers(doc) -> list[str]:
+        """提取页眉页脚文本。"""
+        parts = []
         header_texts = []
         footer_texts = []
         try:
@@ -229,131 +290,170 @@ class DocumentLoader:
         except Exception:
             pass
         if header_texts:
-            all_text_parts.append("[页眉]")
-            all_text_parts.append("\n".join(header_texts))
+            parts.append("[页眉]")
+            parts.append("\n".join(header_texts))
         if footer_texts:
-            all_text_parts.append("[页脚]")
-            all_text_parts.append("\n".join(footer_texts))
+            parts.append("[页脚]")
+            parts.append("\n".join(footer_texts))
+        return parts
+
+    @staticmethod
+    def _extract_docx_notes(raw_xmls: dict) -> list[str]:
+        """提取脚注（footnotes）与尾注（endnotes）。"""
+        parts = []
+        ET = DocumentLoader._get_etree()
+        ns = DocumentLoader._docx_ns
+
+        for key, label in (("word/footnotes.xml", "脚注"), ("word/endnotes.xml", "尾注")):
+            xml_data = raw_xmls.get(key, b"")
+            if not xml_data:
+                continue
+            try:
+                root = ET.fromstring(xml_data)
+                tag = "footnote" if "footnote" in key else "endnote"
+                texts = [
+                    DocumentLoader._docx_extract_text(e).strip()
+                    for e in root.findall(f".//{ns(tag)}")
+                ]
+                texts = [t for t in texts if t]
+                if texts:
+                    parts.append(f"[{label}]")
+                    parts.append("\n".join(texts))
+            except Exception:
+                continue
+        return parts
+
+    @staticmethod
+    def _extract_docx_comments(raw_xmls: dict) -> list[str]:
+        """提取批注（comments）。"""
+        parts = []
+        ET = DocumentLoader._get_etree()
+        ns = DocumentLoader._docx_ns
+        xml_data = raw_xmls.get("word/comments.xml", b"")
+        if not xml_data:
+            return parts
         try:
-            fn_xml = raw_xmls.get("word/footnotes.xml", b"")
-            if fn_xml:
-                root = ET.fromstring(fn_xml)
-                fn_texts = [_extract_text(fn) for fn in root.findall(f".//{_ns('footnote')}")]
-                fn_texts = [t.strip() for t in fn_texts if t.strip()]
-                if fn_texts:
-                    all_text_parts.append("[脚注]")
-                    all_text_parts.append("\n".join(fn_texts))
+            root = ET.fromstring(xml_data)
+            cm_texts = []
+            for cm in root.findall(f".//{ns('comment')}"):
+                author = cm.get("author", "未知")
+                txt = DocumentLoader._docx_extract_text(cm)
+                if txt.strip():
+                    cm_texts.append(f"[批注-{author}]: {txt.strip()}")
+            if cm_texts:
+                parts.append("[批注]")
+                parts.append("\n".join(cm_texts))
         except Exception:
             pass
+        return parts
+
+    @staticmethod
+    def _extract_docx_textboxes(raw_xmls: dict) -> list[str]:
+        """提取浮动文本框（txbxContent）。"""
+        parts = []
+        ET = DocumentLoader._get_etree()
+        ns = DocumentLoader._docx_ns
+        xml_data = raw_xmls.get("word/document.xml", b"")
+        if not xml_data:
+            return parts
         try:
-            en_xml = raw_xmls.get("word/endnotes.xml", b"")
-            if en_xml:
-                root = ET.fromstring(en_xml)
-                en_texts = [_extract_text(en) for en in root.findall(f".//{_ns('endnote')}")]
-                en_texts = [t.strip() for t in en_texts if t.strip()]
-                if en_texts:
-                    all_text_parts.append("[尾注]")
-                    all_text_parts.append("\n".join(en_texts))
+            root = ET.fromstring(xml_data)
+            txbx_texts = [
+                DocumentLoader._docx_extract_text(txbx).strip()
+                for txbx in root.iter(ns("txbxContent"))
+            ]
+            txbx_texts = [t for t in txbx_texts if t]
+            if txbx_texts:
+                parts.append("[浮动文本框]")
+                parts.append("\n".join(txbx_texts))
         except Exception:
             pass
+        return parts
+
+    @staticmethod
+    def _extract_docx_revisions(raw_xmls: dict) -> list[str]:
+        """提取修订插入内容（ins）。"""
+        parts = []
+        ET = DocumentLoader._get_etree()
+        ns = DocumentLoader._docx_ns
+        xml_data = raw_xmls.get("word/document.xml", b"")
+        if not xml_data:
+            return parts
         try:
-            cm_xml = raw_xmls.get("word/comments.xml", b"")
-            if cm_xml:
-                root = ET.fromstring(cm_xml)
-                cm_texts = []
-                for cm in root.findall(f".//{_ns('comment')}"):
-                    author = cm.get("author", "未知")
-                    txt = _extract_text(cm)
-                    if txt.strip():
-                        cm_texts.append(f"[批注-{author}]: {txt.strip()}")
-                if cm_texts:
-                    all_text_parts.append("[批注]")
-                    all_text_parts.append("\n".join(cm_texts))
+            root = ET.fromstring(xml_data)
+            ins_texts = []
+            for ins in root.iter(ns("ins")):
+                author = ins.get("author", "未知")
+                txt = DocumentLoader._docx_extract_text(ins)
+                if txt.strip():
+                    ins_texts.append(f"[修订插入-{author}]: {txt.strip()}")
+            if ins_texts:
+                parts.append("[修订内容]")
+                parts.append("\n".join(ins_texts))
         except Exception:
             pass
-        try:
-            doc_xml = raw_xmls.get("word/document.xml", b"")
-            if doc_xml:
-                root = ET.fromstring(doc_xml)
-                txbx_texts = [_extract_text(txbx) for txbx in root.iter(_ns("txbxContent"))]
-                txbx_texts = [t.strip() for t in txbx_texts if t.strip()]
-                if txbx_texts:
-                    all_text_parts.append("[浮动文本框]")
-                    all_text_parts.append("\n".join(txbx_texts))
-        except Exception:
-            pass
-        try:
-            doc_xml = raw_xmls.get("word/document.xml", b"")
-            if doc_xml:
-                root = ET.fromstring(doc_xml)
-                ins_texts = []
-                for ins in root.iter(_ns("ins")):
-                    author = ins.get("author", "未知")
-                    txt = _extract_text(ins)
-                    if txt.strip():
-                        ins_texts.append(f"[修订插入-{author}]: {txt.strip()}")
-                if ins_texts:
-                    all_text_parts.append("[修订内容]")
-                    all_text_parts.append("\n".join(ins_texts))
-        except Exception:
-            pass
-        try:
-            doc_xml = raw_xmls.get("word/document.xml", b"")
-            if doc_xml:
-                root = ET.fromstring(doc_xml)
+        return parts
+
+    @staticmethod
+    def _extract_docx_tables(raw_xmls: dict, doc) -> list[str]:
+        """
+        提取表格内容。
+
+        优先用原始 XML（保留合并单元格语义），失败时回退到 python-docx 的 tables。
+        """
+        parts = []
+        ET = DocumentLoader._get_etree()
+        ns = DocumentLoader._docx_ns
+        xml_data = raw_xmls.get("word/document.xml", b"")
+        if xml_data:
+            try:
+                root = ET.fromstring(xml_data)
                 table_idx = 0
-                for tbl in root.iter(_ns("tbl")):
+                for tbl in root.iter(ns("tbl")):
                     table_idx += 1
                     table_rows = []
-                    for tr in tbl.iter(_ns("tr")):
+                    for tr in tbl.iter(ns("tr")):
                         cells = []
-                        for tc in tr.iter(_ns("tc")):
-                            tc_pr = tc.find(_ns("tcPr"))
+                        for tc in tr.iter(ns("tc")):
+                            tc_pr = tc.find(ns("tcPr"))
                             span = 1
                             if tc_pr is not None:
-                                gs = tc_pr.find(_ns("gridSpan"))
+                                gs = tc_pr.find(ns("gridSpan"))
                                 if gs is not None and gs.get("val"):
                                     span = int(gs.get("val"))
-                                vm = tc_pr.find(_ns("vMerge"))
+                                vm = tc_pr.find(ns("vMerge"))
                                 if vm is not None and vm.get("val") != "restart":
                                     continue
-                            cell_text = _extract_text(tc)
+                            cell_text = DocumentLoader._docx_extract_text(tc)
                             cells.append(cell_text.strip())
                         if any(c for c in cells):
                             table_rows.append(" | ".join(cells))
                     if table_rows:
-                        all_text_parts.append(f"[表格 {table_idx}]")
-                        all_text_parts.append("\n".join(table_rows))
-            else:
-                tables_text = []
-                for table in doc.tables:
-                    rows_text = [" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows]
-                    tables_text.append("\n".join(rows_text))
-                if tables_text:
-                    all_text_parts.append("[表格内容]")
-                    all_text_parts.append("\n\n".join(tables_text))
-        except Exception:
-            pass
+                        parts.append(f"[表格 {table_idx}]")
+                        parts.append("\n".join(table_rows))
+                if parts:
+                    return parts
+            except Exception:
+                parts = []
+
+        # 回退：python-docx 的 tables
         try:
-            with zipfile.ZipFile(str(path), "r") as z:
-                embedded = [n for n in z.namelist() if "embeddings" in n]
-                if embedded:
-                    warnings_list.append(f"文档包含 {len(embedded)} 个嵌入文件，嵌入内容无法提取，请单独上传")
+            tables_text = []
+            for table in doc.tables:
+                rows_text = [" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows]
+                tables_text.append("\n".join(rows_text))
+            if tables_text:
+                parts.append("[表格内容]")
+                parts.append("\n\n".join(tables_text))
         except Exception:
             pass
-        full_text = "\n\n".join(all_text_parts) if all_text_parts else ""
-        if not full_text.strip():
-            warnings_list.append("文档中未提取到文本内容")
-        return [{
-            "page_content": full_text,
-            "metadata": {
-                "source": str(path), "filename": path.name,
-                "file_type": path.suffix.lower().lstrip("."),
-                "paragraphs": len(paragraphs_text),
-                "file_size": path.stat().st_size,
-                "warnings": warnings_list if warnings_list else None,
-            },
-        }]
+        return parts
+
+    @staticmethod
+    def _get_etree():
+        """延迟导入 xml.etree.ElementTree"""
+        from xml.etree import ElementTree as ET
+        return ET
 
     @staticmethod
     def _try_extract_doc_text(path):

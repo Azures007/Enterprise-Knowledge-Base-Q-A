@@ -3,17 +3,84 @@
  */
 
 const BASE_URL = '/api'
+const TOKEN_KEY = 'kb_access_token'
+const USER_KEY = 'kb_user_info'
+
+// ============================================================
+// Token 与用户信息管理
+// ============================================================
+
+export function getToken() {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setToken(token) {
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token)
+  } else {
+    localStorage.removeItem(TOKEN_KEY)
+  }
+}
+
+export function clearToken() {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USER_KEY)
+}
+
+export function isLoggedIn() {
+  return !!getToken()
+}
+
+export function setUserInfo(info) {
+  localStorage.setItem(USER_KEY, JSON.stringify(info || {}))
+}
+
+export function getUserInfo() {
+  try {
+    return JSON.parse(localStorage.getItem(USER_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+export function isAdmin() {
+  return !!getUserInfo().is_admin
+}
+
+/** 401 回调：token 失效时由调用方决定如何跳转 */
+let _onUnauthorized = null
+export function setUnauthorizedHandler(fn) {
+  _onUnauthorized = fn
+}
+
+function handleUnauthorized() {
+  clearToken()
+  if (_onUnauthorized) _onUnauthorized()
+}
 
 /**
- * 通用请求封装
+ * 通用请求封装：自动附带 Authorization 头
  */
 async function request(url, options = {}) {
-  const config = {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  }
+  const headers = { 'Content-Type': 'application/json' }
+
+  // 自动注入 token（GET 参数形式的请求也会用到）
+  const token = getToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  const config = { headers, ...options }
 
   const response = await fetch(`${BASE_URL}${url}`, config)
+
+  // 401 未认证/令牌失效
+  if (response.status === 401) {
+    const errorData = await response.json().catch(() => ({}))
+    handleUnauthorized()
+    const error = new Error(errorData.detail || '登录已过期，请重新登录')
+    error._isStructured = true
+    error._unauthorized = true
+    throw error
+  }
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}))
@@ -29,6 +96,23 @@ async function request(url, options = {}) {
   }
 
   return response.json()
+}
+
+/**
+ * 用户登录
+ */
+export async function login(username, password) {
+  const res = await request('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  })
+  // 登录成功自动保存 token 与用户信息
+  setToken(res.data.token)
+  setUserInfo({
+    username: res.data.username,
+    is_admin: res.data.is_admin,
+  })
+  return res.data
 }
 
 /**
@@ -58,9 +142,14 @@ export function streamQuery({ question, k = 5, concise = false, collection = nul
   const body = { question, k, concise }
   if (collection) body.collection = collection
 
+  // 自动附带 token
+  const headers = { 'Content-Type': 'application/json' }
+  const token = getToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
   fetch(`${BASE_URL}/query/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
     signal,
   })
@@ -207,6 +296,11 @@ export async function uploadDocument(file, onProgress, targetFilename, targetCol
   if (targetFilename) formData.append('filename', targetFilename)
   if (targetCollection) formData.append('collection', targetCollection)
 
+  // 自动附带 token
+  const uploadHeaders = {}
+  const token = getToken()
+  if (token) uploadHeaders['Authorization'] = `Bearer ${token}`
+
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
 
@@ -258,7 +352,116 @@ export async function uploadDocument(file, onProgress, targetFilename, targetCol
     })
 
     xhr.open('POST', `${BASE_URL}/ingest`)
+    // 附带认证头（传统上传需要登录）
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
     xhr.send(formData)
+  })
+}
+
+/**
+ * 异步上传大文档（>10MB），立即返回 task_id
+ * 上传完成（100%）后还需轮询 GET /ingest/tasks/{task_id} 等待后台解析入库
+ */
+export function uploadDocumentAsync(file, onProgress, targetFilename, targetCollection) {
+  const finalName = targetFilename || file.name
+  const formData = new FormData()
+  formData.append('file', file, finalName)
+  if (targetFilename) formData.append('filename', targetFilename)
+  if (targetCollection) formData.append('collection', targetCollection)
+
+  const token = getToken()
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    }
+
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText)
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(data)
+        } else {
+          const detail = data.detail
+          if (typeof detail === 'object' && detail !== null) {
+            reject({ ...detail, _isStructured: true })
+          } else {
+            reject({ error_type: 'unknown', message: detail || `上传失败 (${xhr.status})`, suggestion: '请重试或联系管理员', _isStructured: true })
+          }
+        }
+      } catch {
+        reject({ error_type: 'parse_error', message: '服务器响应解析失败', suggestion: '请检查后端服务是否正常运行', _isStructured: true })
+      }
+    }
+    xhr.onerror = () => reject({ error_type: 'network_error', message: '网络连接失败', suggestion: '请检查网络连接', _isStructured: true })
+
+    xhr.open('POST', `${BASE_URL}/ingest/async`)
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.send(formData)
+  })
+}
+
+/**
+ * 查询异步导入任务状态（轮询用）
+ */
+export async function getIngestTaskStatus(taskId) {
+  return request(`/ingest/tasks/${taskId}`)
+}
+
+/**
+ * 大文件异步导入阈值（与后端一致，单位字节）
+ */
+export const ASYNC_INGEST_THRESHOLD = 10 * 1024 * 1024 // 10MB
+
+// ============================================================
+// 用户管理 API（仅管理员）
+// ============================================================
+
+/**
+ * 获取用户列表
+ */
+export async function getUsers() {
+  return request('/users')
+}
+
+/**
+ * 创建用户
+ */
+export async function createUser({ username, password, display_name, is_admin }) {
+  return request('/users', {
+    method: 'POST',
+    body: JSON.stringify({ username, password, display_name, is_admin }),
+  })
+}
+
+/**
+ * 删除用户
+ */
+export async function deleteUser(userId) {
+  return request(`/users/${userId}`, { method: 'DELETE' })
+}
+
+/**
+ * 修改自己的密码
+ */
+export async function changePassword(oldPassword, newPassword) {
+  return request('/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+  })
+}
+
+/**
+ * 管理员重置用户密码
+ */
+export async function resetUserPassword(userId, newPassword) {
+  return request(`/users/${userId}/reset-password`, {
+    method: 'POST',
+    body: JSON.stringify({ new_password: newPassword }),
   })
 }
 

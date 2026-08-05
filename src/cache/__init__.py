@@ -1,6 +1,7 @@
-﻿import hashlib
+import hashlib
 import json
 import time
+from collections import OrderedDict
 from threading import Lock
 from typing import Any, Optional
 
@@ -11,8 +12,16 @@ logger = setup_logger(__name__)
 
 
 class MemoryCache:
-    def __init__(self):
-        self._data: dict[str, tuple[float, str]] = {}
+    """
+    带 LRU 淘汰策略的线程安全内存缓存。
+
+    使用 OrderedDict 维护插入/访问顺序：每次 get/set 将键移到末尾，
+    当条目数超过 max_size 时从头部（最久未使用）淘汰。
+    """
+
+    def __init__(self, max_size: int | None = None):
+        self._max_size = max_size or getattr(settings, "CACHE_MAX_ENTRIES", 10000)
+        self._data: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._tag_index: dict[str, set[str]] = {}
         self._lock = Lock()
 
@@ -27,16 +36,34 @@ class MemoryCache:
                 # 清理 tag 索引
                 self._cleanup_key_tags(key)
                 return None
+            # LRU：命中后移到末尾（最近使用）
+            self._data.move_to_end(key)
             return value
 
     def set(self, key: str, value: str, ttl: int, tags: list[str] | None = None):
         with self._lock:
             self._data[key] = (time.time() + ttl, value)
+            # 新写入视为最近使用
+            self._data.move_to_end(key)
             if tags:
                 for tag in tags:
                     if tag not in self._tag_index:
                         self._tag_index[tag] = set()
                     self._tag_index[tag].add(key)
+            self._evict_if_needed()
+
+    def _evict_if_needed(self):
+        """超过最大容量时，从头部淘汰最久未使用的条目"""
+        overflow = len(self._data) - self._max_size
+        if overflow <= 0:
+            return
+        evicted = 0
+        while len(self._data) > self._max_size:
+            oldest_key, _ = self._data.popitem(last=False)
+            self._cleanup_key_tags(oldest_key)
+            evicted += 1
+        if evicted:
+            logger.debug(f"缓存已淘汰 {evicted} 条 LRU 条目（容量 {self._max_size}）")
 
     def clear(self):
         with self._lock:
@@ -66,15 +93,19 @@ class MemoryCache:
         with self._lock:
             return len(self._data)
 
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
 
 class QACache:
-    def __init__(self, ttl: int = 3600, prefix: str = "qa_cache:"):
-        self.ttl = ttl
+    def __init__(self, ttl: int | None = None, prefix: str = "qa_cache:"):
+        self.ttl = ttl or getattr(settings, "CACHE_QA_TTL", 3600)
         self.prefix = prefix
         self._tag_index_prefix = "qa_cache:tag_index:"
         self._redis = None
         self._redis_available = False
-        self._memory = MemoryCache()
+        self._memory = MemoryCache(max_size=getattr(settings, "CACHE_MAX_ENTRIES", 10000))
         self._init_redis()
 
     def _init_redis(self):

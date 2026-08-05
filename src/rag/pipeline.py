@@ -106,6 +106,18 @@ class RAGPipeline:
 
 用户问题：{question}"""
 
+    # ---- 知识库为空时的通用知识模式（带上传引导） ----
+    GENERAL_EMPTY_KB_PROMPT = """你是一个知识渊博的智能助手。请用中文专业地回答用户的问题。
+
+注意：当前企业的知识库中还没有上传任何文档。请你：
+1. 首先基于你自己的通用知识，专业、完整地回答用户的问题；
+2. 在回答的末尾，自然地提醒用户：当前知识库为空，如需获得更准确、针对性的回答，
+   可以将相关文档上传到知识库后再提问。
+
+如果你不确定答案，请如实告知，不要编造信息。
+
+用户问题：{question}"""
+
     def __init__(
         self,
         embedder: Any | None = None,
@@ -122,11 +134,18 @@ class RAGPipeline:
         self.llm = llm or BailianLLM()
         self.vector_store = vector_store or self._create_default_vector_store()
 
+        # 重排器（用于检索后精排）
+        from src.reranker import Reranker
+        self.reranker = Reranker()
+
         self._total_queries = 0
         self._total_tokens_estimate = 0
 
         store_type = getattr(settings, 'VECTOR_STORE_TYPE', 'pg')
-        logger.info(f"RAG 混合管线初始化完成（向量后端: {store_type}）")
+        logger.info(
+            f"RAG 混合管线初始化完成（向量后端: {store_type}, "
+            f"重排模式: {self.reranker.mode}）"
+        )
 
     @staticmethod
     def _create_default_vector_store():
@@ -159,6 +178,7 @@ class RAGPipeline:
         stream: bool = False,
         concise: bool = False,
         filter_criteria: dict[str, Any] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """
         执行一次混合问答。
@@ -171,6 +191,7 @@ class RAGPipeline:
             stream:          是否使用流式输出
             concise:         是否使用简洁模式
             filter_criteria: 元数据过滤条件
+            history:         多轮对话历史，格式: [{"role": "user"|"assistant", "content": "..."}]
 
         Returns:
             dict:
@@ -185,8 +206,8 @@ class RAGPipeline:
         self._total_queries += 1
         logger.info(f"收到问题: {question[:120]}")
 
-        # ---- 第 0 步：检查缓存 ----
-        if not stream:
+        # ---- 第 0 步：检查缓存（仅无对话历史时使用缓存） ----
+        if not stream and not history:
             cached = qa_cache.get(question)
             if cached is not None:
                 logger.info(f"缓存命中: {question[:80]}...")
@@ -199,7 +220,208 @@ class RAGPipeline:
                     "from_cache": True,
                 }
 
-        # ---- 第 1 步：检查知识库，尝试检索 ----
+        # ---- 第 1~2 步：检索 + 组装提示 ----
+        prepared = self._prepare_query(
+            question=question,
+            k=k,
+            concise=concise,
+            filter_criteria=filter_criteria,
+        )
+
+        # ---- 第 3 步：LLM 生成 ----
+        logger.info(f"正在生成回答（模式: {prepared['answer_type']}）...")
+        try:
+            if stream:
+                answer_generator = self.llm.stream(
+                    prompt=question,
+                    system_prompt=prepared["system_prompt"],
+                    history=history,
+                )
+                return {
+                    "answer": answer_generator,
+                    "sources": prepared["sources"],
+                    "context": prepared["retrieved_docs"],
+                    "answer_type": prepared["answer_type"],
+                    "stream": True,
+                }
+            else:
+                answer = self.llm.generate(
+                    prompt=question,
+                    system_prompt=prepared["system_prompt"],
+                    history=history,
+                )
+                logger.info(
+                    f"回答生成完成（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
+                )
+                # 保存到缓存（非流式、无历史），按来源文件打标签以便精准失效
+                if not history:
+                    cache_tags = [
+                        f"doc:{s.get('filename', '')}"
+                        for s in prepared["sources"] if s.get("filename")
+                    ]
+                    qa_cache.set(question, {
+                        "answer": answer,
+                        "sources": prepared["sources"],
+                        "answer_type": prepared["answer_type"],
+                    }, tags=cache_tags)
+                return {
+                    "answer": answer,
+                    "sources": prepared["sources"],
+                    "context": prepared["retrieved_docs"],
+                    "answer_type": prepared["answer_type"],
+                    "stream": False,
+                    "from_cache": False,
+                }
+
+        except Exception as e:
+            raise RAGPipelineError(f"回答生成失败: {e}") from e
+
+    async def aquery(
+        self,
+        question: str,
+        k: int | None = None,
+        stream: bool = False,
+        concise: bool = False,
+        filter_criteria: dict[str, Any] | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        异步执行一次混合问答（用于 FastAPI 事件循环，不阻塞其他请求）。
+
+        接口语义与 query() 完全一致。
+        """
+        if not question or not question.strip():
+            raise RAGPipelineError("问题不能为空")
+
+        self._total_queries += 1
+        logger.info(f"收到问题(异步): {question[:120]}")
+
+        # ---- 第 0 步：检查缓存（仅无对话历史时使用缓存） ----
+        if not stream and not history:
+            cached = qa_cache.get(question)
+            if cached is not None:
+                logger.info(f"缓存命中: {question[:80]}...")
+                return {
+                    "answer": cached["answer"],
+                    "sources": cached.get("sources", []),
+                    "context": [],
+                    "answer_type": cached.get("answer_type", "general"),
+                    "stream": False,
+                    "from_cache": True,
+                }
+
+        # ---- 第 1~2 步：检索 + 组装提示（异步） ----
+        prepared = await self._aprepare_query(
+            question=question,
+            k=k,
+            concise=concise,
+            filter_criteria=filter_criteria,
+        )
+
+        # ---- 第 3 步：LLM 生成（异步） ----
+        logger.info(f"正在生成回答(异步)（模式: {prepared['answer_type']}）...")
+        try:
+            if stream:
+                answer_generator = self.llm.astream(
+                    prompt=question,
+                    system_prompt=prepared["system_prompt"],
+                    history=history,
+                )
+                return {
+                    "answer": answer_generator,
+                    "sources": prepared["sources"],
+                    "context": prepared["retrieved_docs"],
+                    "answer_type": prepared["answer_type"],
+                    "stream": True,
+                }
+            else:
+                answer = await self.llm.agenerate(
+                    prompt=question,
+                    system_prompt=prepared["system_prompt"],
+                    history=history,
+                )
+                logger.info(
+                    f"回答生成完成(异步)（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
+                )
+                if not history:
+                    cache_tags = [
+                        f"doc:{s.get('filename', '')}"
+                        for s in prepared["sources"] if s.get("filename")
+                    ]
+                    qa_cache.set(question, {
+                        "answer": answer,
+                        "sources": prepared["sources"],
+                        "answer_type": prepared["answer_type"],
+                    }, tags=cache_tags)
+                return {
+                    "answer": answer,
+                    "sources": prepared["sources"],
+                    "context": prepared["retrieved_docs"],
+                    "answer_type": prepared["answer_type"],
+                    "stream": False,
+                    "from_cache": False,
+                }
+
+        except Exception as e:
+            raise RAGPipelineError(f"回答生成失败(异步): {e}") from e
+
+    def stream_query(
+        self,
+        question: str,
+        k: int | None = None,
+        concise: bool = False,
+        filter_criteria: dict[str, Any] | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        流式混合问答的快捷方式。
+        """
+        return self.query(
+            question=question,
+            k=k,
+            stream=True,
+            concise=concise,
+            filter_criteria=filter_criteria,
+            history=history,
+        )
+
+    async def astream_query(
+        self,
+        question: str,
+        k: int | None = None,
+        concise: bool = False,
+        filter_criteria: dict[str, Any] | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        异步流式混合问答的快捷方式。
+        """
+        return await self.aquery(
+            question=question,
+            k=k,
+            stream=True,
+            concise=concise,
+            filter_criteria=filter_criteria,
+            history=history,
+        )
+
+    # ================================================================
+    # 检索与提示词构建（同步/异步共享逻辑）
+    # ================================================================
+
+    def _prepare_query(
+        self,
+        question: str,
+        k: int | None = None,
+        concise: bool = False,
+        filter_criteria: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        执行向量检索并组装系统提示词（同步路径）。
+
+        Returns:
+            dict: 包含 system_prompt, sources, retrieved_docs, answer_type
+        """
         kb_chunk_count = self.vector_store.count()
         retrieved_docs = []
         has_relevant_docs = False
@@ -207,34 +429,187 @@ class RAGPipeline:
         if kb_chunk_count > 0:
             logger.info(f"知识库中有 {kb_chunk_count} 个文档块，尝试向量检索...")
             try:
-                retrieved_docs = self.vector_store.similarity_search(
+                # 阶段 1：向量粗召回（候选放宽，避免漏掉真正相关块）
+                candidate_k = k or settings.RETRIEVAL_CANDIDATE_K
+                candidates = self.vector_store.similarity_search(
                     query=question,
-                    k=k or settings.RETRIEVAL_TOP_K,
+                    k=candidate_k,
                     filter=filter_criteria,
+                )
+                # 阶段 2：重排精排，取最终 top-k
+                final_k = min(k or settings.RETRIEVAL_TOP_K, len(candidates)) if candidates else 0
+                retrieved_docs = self.reranker.rerank(
+                    query=question,
+                    candidates=candidates,
+                    top_k=final_k,
                 )
             except Exception as e:
                 logger.warning(f"检索失败，将使用通用知识: {e}")
 
-            if retrieved_docs:
-                # 检查检索质量：最高分是否超过阈值
-                max_score = max(doc.get("score", 0) for doc in retrieved_docs)
-                if max_score >= SCORE_THRESHOLD:
-                    has_relevant_docs = True
-                    logger.info(
-                        f"检索到 {len(retrieved_docs)} 个相关文档块"
-                        f"（最高分: {max_score:.3f}）→ 使用知识库增强模式"
-                    )
-                else:
-                    logger.info(
-                        f"检索结果分数偏低（最高分: {max_score:.3f}）"
-                        f"→ 将结合通用知识回答"
-                    )
-            else:
-                logger.info("检索结果为空，将使用通用知识回答")
-        else:
-            logger.info("知识库为空，将使用通用知识回答")
+            # 阶段 3：过滤低分块与无关文档（方案 1 + 2）
+            retrieved_docs, has_relevant_docs = self._filter_relevant_docs(retrieved_docs)
 
-        # ---- 第 2 步：组装提示 ----
+        system_prompt, answer_type, sources, context = self._build_prompt(
+            question=question,
+            concise=concise,
+            retrieved_docs=retrieved_docs,
+            has_relevant_docs=has_relevant_docs,
+            kb_chunk_count=kb_chunk_count,
+        )
+
+        estimated_tokens = len(system_prompt) + len(question) * 2
+        self._total_tokens_estimate += estimated_tokens
+
+        return {
+            "system_prompt": system_prompt,
+            "sources": sources,
+            "retrieved_docs": retrieved_docs,
+            "answer_type": answer_type,
+            "context_text": context,
+        }
+
+    async def _aprepare_query(
+        self,
+        question: str,
+        k: int | None = None,
+        concise: bool = False,
+        filter_criteria: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """执行向量检索并组装系统提示词（异步路径）。"""
+        kb_chunk_count = await self.vector_store.acount()
+        retrieved_docs = []
+        has_relevant_docs = False
+
+        if kb_chunk_count > 0:
+            logger.info(f"知识库中有 {kb_chunk_count} 个文档块，尝试向量检索(异步)...")
+            try:
+                # 阶段 1：向量粗召回（候选放宽）
+                candidate_k = k or settings.RETRIEVAL_CANDIDATE_K
+                candidates = await self.vector_store.asimilarity_search(
+                    query=question,
+                    k=candidate_k,
+                    filter=filter_criteria,
+                )
+                # 阶段 2：重排精排，取最终 top-k
+                final_k = min(k or settings.RETRIEVAL_TOP_K, len(candidates)) if candidates else 0
+                retrieved_docs = self.reranker.rerank(
+                    query=question,
+                    candidates=candidates,
+                    top_k=final_k,
+                )
+            except Exception as e:
+                logger.warning(f"检索失败(异步)，将使用通用知识: {e}")
+
+            # 阶段 3：过滤低分块与无关文档（方案 1 + 2）
+            retrieved_docs, has_relevant_docs = self._filter_relevant_docs(retrieved_docs)
+
+        system_prompt, answer_type, sources, context = self._build_prompt(
+            question=question,
+            concise=concise,
+            retrieved_docs=retrieved_docs,
+            has_relevant_docs=has_relevant_docs,
+            kb_chunk_count=kb_chunk_count,
+        )
+
+        estimated_tokens = len(system_prompt) + len(question) * 2
+        self._total_tokens_estimate += estimated_tokens
+
+        return {
+            "system_prompt": system_prompt,
+            "sources": sources,
+            "retrieved_docs": retrieved_docs,
+            "answer_type": answer_type,
+            "context_text": context,
+        }
+
+    def _filter_relevant_docs(
+        self,
+        retrieved_docs: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """
+        过滤低相关文档块（方案 1 + 2）。
+
+        方案 1：单块过滤 —— 剔除 score < SCORE_THRESHOLD 的低分块。
+        方案 2：文档级过滤 —— 按文档聚合，仅保留"文档最高分 ≥ 文档级阈值"的
+                文档，其余文档整篇剔除（其所有块均不进入 context / sources）。
+
+        Args:
+            retrieved_docs: 向量检索返回的候选块列表
+
+        Returns:
+            (filtered_docs, has_relevant_docs):
+                - filtered_docs:     过滤后的相关块列表
+                - has_relevant_docs: 是否存在相关文档（决定是否走 RAG 模式）
+        """
+        if not retrieved_docs:
+            return [], False
+
+        # 方案 1：按块分数过滤，仅保留高分块
+        relevant_chunks = [
+            doc for doc in retrieved_docs
+            if doc.get("score", 0) >= SCORE_THRESHOLD
+        ]
+        if not relevant_chunks:
+            logger.info(
+                f"检索到 {len(retrieved_docs)} 个候选块，但均低于阈值 "
+                f"{SCORE_THRESHOLD} → 视为无相关文档"
+            )
+            return [], False
+
+        # 方案 2：按文档聚合，只保留"文档最高分 ≥ 文档级阈值"的文档
+        # 单块阈值较低（0.35），弱相关块也可能通过；文档级阈值取更高值，
+        # 只有当某文档至少有一个强相关块时才整篇保留，避免弱相关文档混入来源
+        doc_key = lambda d: d.get("metadata", {}).get("source") or d.get("metadata", {}).get("filename", "")
+
+        # 计算每个文档的最高分
+        doc_max_score: dict[str, float] = {}
+        for d in retrieved_docs:
+            key = doc_key(d)
+            doc_max_score[key] = max(doc_max_score.get(key, 0), d.get("score", 0))
+
+        # 文档级阈值：比单块阈值更严格，过滤弱相关文档
+        doc_threshold = min(SCORE_THRESHOLD + 0.1, 0.55)
+        relevant_docs = {
+            key for key, score in doc_max_score.items()
+            if score >= doc_threshold
+        }
+
+        if not relevant_docs:
+            logger.info(
+                f"检索到 {len(relevant_chunks)} 个高分块，但所有文档最高分 "
+                f"均低于文档级阈值 {doc_threshold:.2f} → 视为无相关文档"
+            )
+            return [], False
+
+        # 保留相关文档的所有检索块（按原顺序）
+        filtered = [
+            d for d in retrieved_docs if doc_key(d) in relevant_docs
+        ]
+
+        # 按分数降序排列，保证 context 里最相关的块靠前
+        filtered.sort(key=lambda d: d.get("score", 0), reverse=True)
+
+        logger.info(
+            f"检索过滤: {len(retrieved_docs)} 个候选块 → "
+            f"{len(filtered)} 个块，来自 {len(relevant_docs)} 个相关文档"
+            f"（文档级阈值: {doc_threshold:.2f}, 最高分: {filtered[0].get('score', 0):.3f}）"
+        )
+        return filtered, True
+
+    def _build_prompt(
+        self,
+        question: str,
+        concise: bool,
+        retrieved_docs: list[dict[str, Any]],
+        has_relevant_docs: bool,
+        kb_chunk_count: int,
+    ) -> tuple[str, str, list[dict[str, Any]], str]:
+        """
+        根据检索结果组装系统提示词。
+
+        Returns:
+            (system_prompt, answer_type, sources, context_text)
+        """
         sources = []
         context_text = ""
 
@@ -277,71 +652,10 @@ class RAGPipeline:
                 )
             else:
                 # 知识库完全为空 → 纯通用知识
-                system_prompt = self.GENERAL_SYSTEM_PROMPT.format(question=question)
+                # 带上传引导的提示词，让 LLM 回答后用自然语言提醒可上传文档
+                system_prompt = self.GENERAL_EMPTY_KB_PROMPT.format(question=question)
 
-        # 估计 token 消耗
-        estimated_tokens = len(system_prompt) + len(question) * 2
-        self._total_tokens_estimate += estimated_tokens
-
-        # ---- 第 3 步：LLM 生成 ----
-        logger.info(f"正在生成回答（模式: {answer_type}）...")
-        try:
-            if stream:
-                answer_generator = self.llm.stream(
-                    prompt=question,
-                    system_prompt=system_prompt,
-                )
-                return {
-                    "answer": answer_generator,
-                    "sources": sources,
-                    "context": retrieved_docs or [],
-                    "answer_type": answer_type,
-                    "stream": True,
-                }
-            else:
-                answer = self.llm.generate(
-                    prompt=question,
-                    system_prompt=system_prompt,
-                )
-                logger.info(
-                    f"回答生成完成（模式: {answer_type}, 长度={len(answer)}字）"
-                )
-                # 保存到缓存（非流式），按来源文件打标签以便精准失效
-                cache_tags = [f"doc:{s.get('filename', '')}" for s in sources if s.get("filename")]
-                qa_cache.set(question, {
-                    "answer": answer,
-                    "sources": sources,
-                    "answer_type": answer_type,
-                }, tags=cache_tags)
-                return {
-                    "answer": answer,
-                    "sources": sources,
-                    "context": retrieved_docs or [],
-                    "answer_type": answer_type,
-                    "stream": False,
-                    "from_cache": False,
-                }
-
-        except Exception as e:
-            raise RAGPipelineError(f"回答生成失败: {e}") from e
-
-    def stream_query(
-        self,
-        question: str,
-        k: int | None = None,
-        concise: bool = False,
-        filter_criteria: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """
-        流式混合问答的快捷方式。
-        """
-        return self.query(
-            question=question,
-            k=k,
-            stream=True,
-            concise=concise,
-            filter_criteria=filter_criteria,
-        )
+        return system_prompt, answer_type, sources, context_text
 
     # ================================================================
     # 知识库管理
@@ -370,8 +684,29 @@ class RAGPipeline:
                 logger.info("知识库已更新，问答缓存已清空（无文件名信息）")
         return result
 
+    async def aadd_documents(self, documents: list[dict[str, Any]], document_id: int | None = None) -> int:
+        """
+        向知识库中添加文档（异步版本）。
+
+        仅使引用了这些文档来源的问答缓存失效，而非清空全部缓存。
+        """
+        result = await self.vector_store.aadd_documents(documents, document_id=document_id)
+        if result > 0:
+            affected_tags = []
+            for doc in documents:
+                filename = doc.get("metadata", {}).get("filename")
+                if filename:
+                    affected_tags.append(f"doc:{filename}")
+            if affected_tags:
+                qa_cache.invalidate_by_tags(affected_tags)
+                logger.info(f"知识库已更新，已按来源文件失效 {len(affected_tags)} 个标签的缓存")
+            else:
+                qa_cache.clear()
+                logger.info("知识库已更新，问答缓存已清空（无文件名信息）")
+        return result
+
     def get_knowledge_base_stats(self) -> dict[str, Any]:
-        """获取知识库统计信息"""
+        """获取知识库统计信息（CLI 使用）"""
         return {
             "total_chunks": self.vector_store.count(),
             "total_queries": self._total_queries,
@@ -385,16 +720,28 @@ class RAGPipeline:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """
-        获取当前集合中的所有文档块及其内容。
-
-        Args:
-            limit:  最大返回条数
-            offset: 分页偏移
-
-        Returns:
-            list[dict]: 每项包含 id, content, metadata
+        获取当前集合中的所有文档块及其内容（CLI 使用）。
         """
         return self.vector_store.get_all_chunks(limit=limit, offset=offset)
+
+    async def aget_knowledge_base_stats(self) -> dict[str, Any]:
+        """获取知识库统计信息（异步版本）"""
+        return {
+            "total_chunks": await self.vector_store.acount(),
+            "total_queries": self._total_queries,
+            "estimated_tokens_used": self._total_tokens_estimate,
+            "collections": await self.vector_store.alist_collections(),
+        }
+
+    async def aget_collection_chunks(
+        self,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        获取当前集合中的所有文档块及其内容（异步版本）。
+        """
+        return await self.vector_store.aget_all_chunks(limit=limit, offset=offset)
 
     # ================================================================
     # 内部方法
@@ -412,19 +759,51 @@ class RAGPipeline:
 
     @staticmethod
     def _extract_sources(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """提取并去重来源信息"""
-        seen = set()
-        sources = []
+        """
+        提取并去重来源信息，并按文档聚合被检索到的分块。
+
+        同一文档的多个命中块会合并为一个来源，chunks 中按相似度分数降序。
+        返回的每项含:
+            filename, source, page, slide, score,
+            chunks: [{content, score, chunk_index}, ...]
+        """
+        # 按 source 分组收集每个文档的命中块
+        doc_chunks: dict[str, dict] = {}
+        order: list[str] = []
+
         for doc in documents:
             meta = doc.get("metadata", {})
             source_key = meta.get("source", "")
-            if source_key and source_key not in seen:
-                seen.add(source_key)
-                sources.append({
+            if not source_key:
+                continue
+
+            if source_key not in doc_chunks:
+                doc_chunks[source_key] = {
                     "filename": meta.get("filename", "未知"),
                     "source": source_key,
                     "page": meta.get("page"),
                     "slide": meta.get("slide"),
-                    "score": doc.get("score", 0),
-                })
+                    "score": 0.0,
+                    "chunks": [],
+                }
+                order.append(source_key)
+
+            entry = doc_chunks[source_key]
+            # 该文档的最高分作为来源分
+            entry["score"] = max(entry["score"], doc.get("score", 0))
+            # 追加命中块
+            entry["chunks"].append({
+                "content": doc.get("content", ""),
+                "score": doc.get("score", 0),
+                "chunk_index": meta.get("chunk_index"),
+            })
+
+        # 按文档最高分降序排列来源
+        sources = [doc_chunks[k] for k in order]
+        sources.sort(key=lambda s: s["score"], reverse=True)
+
+        # 每个文档内部的块按分数降序
+        for s in sources:
+            s["chunks"].sort(key=lambda c: c["score"], reverse=True)
+
         return sources
