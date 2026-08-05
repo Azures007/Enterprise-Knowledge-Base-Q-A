@@ -36,6 +36,14 @@ export default function ChatArea({
     if (!loading) inputRef.current?.focus()
   }, [loading])
 
+  // 暴露全局问问题入口（供"相关问题"按钮点击发送）
+  useEffect(() => {
+    window.__askQuestion = (q) => {
+      sendMessage(q)
+    }
+    return () => { delete window.__askQuestion }
+  }, [sendMessage])
+
   // 停止当前回答
   const handleStop = useCallback(() => {
     if (abortRef.current) {
@@ -45,8 +53,8 @@ export default function ChatArea({
   }, [])
 
   // 发送消息
-  const sendMessage = useCallback(async () => {
-    const question = input.trim()
+  const sendMessage = useCallback(async (overrideQuestion) => {
+    const question = (overrideQuestion ?? input).trim()
     if (!question || loading || !serverOnline) return
 
     // 创建 AbortController

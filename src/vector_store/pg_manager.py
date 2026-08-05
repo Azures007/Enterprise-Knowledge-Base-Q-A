@@ -250,9 +250,26 @@ class PGVectorStore:
                     content         TEXT NOT NULL,
                     metadata        JSONB DEFAULT '{{}}'::jsonb,
                     embedding       VECTOR({settings.VECTOR_DIMENSION}),
+                    search_vector   tsvector GENERATED ALWAYS AS
+                                    (to_tsvector('simple', coalesce(content, ''))) STORED,
                     created_at      TIMESTAMP DEFAULT NOW()
                 )
             """)
+            # 兼容旧表：无 search_vector 列时补充生成列 + GIN 索引
+            try:
+                await conn.execute("""
+                    ALTER TABLE chunks ADD COLUMN IF NOT EXISTS search_vector tsvector
+                    GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED
+                """)
+            except Exception:
+                pass
+            try:
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_chunks_search_vector
+                    ON chunks USING GIN (search_vector)
+                """)
+            except Exception:
+                pass
 
             # 对话表
             await conn.execute("""
@@ -974,6 +991,138 @@ class PGVectorStore:
         )
         return results
 
+    async def ahybrid_search(
+        self,
+        query: str,
+        k: int | None = None,
+        filter: dict[str, Any] | None = None,
+        vector_weight: float = 0.7,
+        keyword_weight: float = 0.3,
+    ) -> list[dict[str, Any]]:
+        """
+        混合检索：向量相似度 + 关键词加权融合。
+
+        - 向量分：余弦相似度（0~1）
+        - 关键词分：n-gram 关键词命中率（0~1）。中文按 2~4 字切分，
+          英文按整词，统计命中率。不依赖 PostgreSQL 分词器（对中文有效）。
+        - 综合分 = vector_weight * 向量分 + keyword_weight * 关键词分
+
+        解决纯向量检索对专有名词/编号/代码片段召回差的问题：
+        关键词命中的块即使向量分不高，也会因关键词分被提升。
+        """
+        k = k or settings.RETRIEVAL_TOP_K
+
+        # 计算查询向量
+        try:
+            query_embedding = await self._aembed_query(query)
+        except Exception as e:
+            raise PGVectorStoreError(f"查询嵌入计算失败: {e}") from e
+        embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
+
+        coll_id = await self._aensure_collection(self.collection_name)
+
+        # 提取查询关键词（英文整词 + 中文 2~4 字 n-gram）
+        keywords = self._extract_query_keywords(query)
+
+        # 无有效关键词时退化为纯向量检索
+        if not keywords:
+            return await self.asimilarity_search(query, k=k, filter=filter)
+
+        # 元数据过滤
+        filter_sql = ""
+        params: list = [embedding_str, coll_id, k]
+        if filter:
+            conds = []
+            for key, val in filter.items():
+                params.append(key)
+                params.append(str(val))
+                n = len(params)
+                conds.append(f"metadata->>${n - 1} = ${n}")
+            filter_sql = " AND " + " AND ".join(conds)
+
+        # 关键词命中计数：每命中一个关键词 content LIKE %kw% 计 1 分（boolean→int）
+        kw_conditions = []
+        for i, kw in enumerate(keywords):
+            params.append(f"%{kw}%")
+            kw_conditions.append(f"(CASE WHEN content LIKE ${len(params)} THEN 1 ELSE 0 END)")
+        kw_score_sql = " + ".join(kw_conditions) if kw_conditions else "0"
+
+        async with (await self._aconn()).acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    content,
+                    metadata,
+                    1 - (embedding <=> $1::vector) AS cosine_similarity,
+                    -- 关键词命中数（0 ~ len(keywords)），归一化到 0~1
+                    LEAST(1.0, ({kw_score_sql})::float / {max(len(keywords), 1)}) AS keyword_score
+                FROM chunks
+                WHERE collection_id = $2{filter_sql}
+                ORDER BY ({vector_weight} * (1 - (embedding <=> $1::vector))
+                         + {keyword_weight} * LEAST(1.0, ({kw_score_sql})::float / {max(len(keywords), 1)})) DESC
+                LIMIT $3
+                """,
+                *params,
+            )
+
+        results = []
+        for row in rows:
+            cosine_sim = float(row["cosine_similarity"])
+            keyword_score = float(row["keyword_score"])
+            vec_score = max(0, cosine_sim)
+            combined = vector_weight * vec_score + keyword_weight * keyword_score
+            results.append({
+                "content": row["content"],
+                "metadata": _json_or_dict(row["metadata"]),
+                "score": round(combined, 4),
+                "vector_score": round(vec_score, 4),
+                "keyword_score": round(keyword_score, 4),
+                "distance": round(1.0 - vec_score, 4),
+            })
+
+        logger.debug(
+            f"混合检索完成: query='{query[:50]}...', "
+            f"k={k}, 结果数={len(results)}"
+        )
+        return results
+
+    @staticmethod
+    def _extract_query_keywords(query: str) -> list[str]:
+        """
+        从查询文本提取关键词列表（中英文兼容）。
+
+        - 英文/数字：按整词保留（如 ERP、192.168、postgresql）
+        - 中文：按 2~4 字 n-gram 切分（如 "考勤制度" → 考勤、勤制、制度、考勤制...）
+        - 过滤过短/无意义的词，去重
+        """
+        import re
+
+        keywords = []
+        # 英文单词 + 数字 + 代码片段
+        en_words = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_.\-]{1,}", query)
+        keywords.extend(w.lower() for w in en_words)
+
+        # 中文连续片段（2字及以上）
+        cn_segments = re.findall(r"[一-鿿]{2,}", query)
+        for seg in cn_segments:
+            # 2-gram 和 3-gram 作为关键词（覆盖中文词边界）
+            for n in (2, 3):
+                for i in range(len(seg) - n + 1):
+                    gram = seg[i:i + n]
+                    if gram not in keywords:
+                        keywords.append(gram)
+
+        # 去重并限制数量（避免 SQL 过长）
+        seen = set()
+        result = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                result.append(kw)
+            if len(result) >= 15:
+                break
+        return result
+
     async def aget_all_chunks(
         self,
         limit: int = 200,
@@ -1441,6 +1590,9 @@ class PGVectorStore:
 
     def similarity_search(self, query, k=None, filter=None) -> list[dict]:
         return self._sync(lambda: self.asimilarity_search(query, k, filter))
+
+    def hybrid_search(self, query, k=None, filter=None, vector_weight=0.7, keyword_weight=0.3) -> list[dict]:
+        return self._sync(lambda: self.ahybrid_search(query, k, filter, vector_weight, keyword_weight))
 
     def count(self) -> int:
         return self._sync(lambda: self.acount())

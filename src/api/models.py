@@ -48,6 +48,7 @@ class SourceChunk(BaseModel):
 class SourceInfo(BaseModel):
     """回答来源信息"""
 
+    index: Optional[int] = Field(None, description="引用编号，对应回答中的 [N] 标注")
     filename: str = Field(..., description="文件名")
     source: str = Field("", description="来源路径")
     page: Optional[int] = Field(None, description="PDF 页码")
@@ -72,6 +73,7 @@ class QueryResponseData(BaseModel):
     answer_type: str = "general"
     collection: Optional[str] = None
     stats: QueryStats = QueryStats()
+    related_questions: list[str] = Field(default_factory=list, description="推荐的相关问题")
 
 
 class APIResponse(BaseModel):

@@ -83,6 +83,18 @@ class Settings(BaseSettings):
     RETRIEVAL_CANDIDATE_K: int = 20
     """向量检索的候选块数量（重排前的粗召回，重排后取前 RETRIEVAL_TOP_K）"""
 
+    HYBRID_SEARCH_ENABLED: bool = True
+    """是否启用混合检索（向量 0.7 + 关键词 0.3 融合）。提升专有名词/编号类查询召回"""
+
+    QUERY_REWRITE_ENABLED: bool = True
+    """是否启用多轮问题重写（结合历史把当前问题改写成独立完整问题）"""
+
+    RELATED_QUESTIONS_ENABLED: bool = True
+    """是否在回答后生成相关问题推荐"""
+
+    CITE_SOURCES_ENABLED: bool = True
+    """是否启用回答内嵌 [N] 引用标注"""
+
     RERANK_ENABLED: bool = True
     """是否启用重排。优先使用本地交叉编码器（bge-reranker），
        依赖不可用时自动降级为关键词重合的轻量重排"""

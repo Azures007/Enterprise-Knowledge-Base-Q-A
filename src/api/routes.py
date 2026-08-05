@@ -613,6 +613,7 @@ async def query_knowledge_base(
                     retrieved_chunks=len(result["context"]),
                     unique_sources=len(result["sources"]),
                 ),
+                related_questions=result.get("related_questions", []),
             ),
         )
     except Exception as e:

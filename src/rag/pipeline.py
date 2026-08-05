@@ -65,7 +65,8 @@ class RAGPipeline:
 
 ### 1️⃣ 如果检索到了相关的知识库文档
 优先基于文档内容回答，但**不局限于此**——你可以综合自己的知识给出更完整的回答。
-- 引用知识库内容时标注 📚 来源（文件名）
+- 引用知识库内容时，在句子末尾标注来源编号 [N]
+  （N 对应「参考文档」的序号，如 [1]、[2]，可多个如 [1][2]）
 - 用自己的知识补充时标注 💡 补充说明
 
 ### 2️⃣ 如果没有检索到相关文档，或文档不相关
@@ -73,6 +74,12 @@ class RAGPipeline:
 
 ### 3️⃣ 混合场景
 如果知识库有部分相关信息，结合文档和你自己的知识给出完整、全面的回答。
+
+## 引用规则（重要）
+- 回答中每引用一个文档的某句话/数据，就在对应句子末尾加上 [N]
+- N 必须是「参考文档内容」列表中实际存在的序号，不要编造不存在的序号
+- 来源编号 [N] 紧跟在引用的句子后面，格式如：根据公司规定，迟到超过30分钟记旷工半天[1]。
+- 如果回答没有引用任何文档，则不要添加任何 [N]
 
 ## 规则
 - 中文回答
@@ -220,9 +227,16 @@ class RAGPipeline:
                     "from_cache": True,
                 }
 
+        # ---- 第 0.5 步：多轮问题重写（有历史时） ----
+        rewritten_question = question
+        if history and getattr(settings, "QUERY_REWRITE_ENABLED", True):
+            rewritten_question = self._rewrite_question(question, history)
+            if rewritten_question and rewritten_question != question:
+                logger.info(f"问题重写: '{question[:50]}' → '{rewritten_question[:60]}'")
+
         # ---- 第 1~2 步：检索 + 组装提示 ----
         prepared = self._prepare_query(
-            question=question,
+            question=rewritten_question,
             k=k,
             concise=concise,
             filter_criteria=filter_criteria,
@@ -253,6 +267,10 @@ class RAGPipeline:
                 logger.info(
                     f"回答生成完成（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
                 )
+                # 生成相关问题推荐（基于检索到的知识库文档）
+                related = []
+                if prepared["retrieved_docs"] and getattr(settings, "RELATED_QUESTIONS_ENABLED", True):
+                    related = self._relate_questions(question, answer)
                 # 保存到缓存（非流式、无历史），按来源文件打标签以便精准失效
                 if not history:
                     cache_tags = [
@@ -271,6 +289,7 @@ class RAGPipeline:
                     "answer_type": prepared["answer_type"],
                     "stream": False,
                     "from_cache": False,
+                    "related_questions": related,
                 }
 
         except Exception as e:
@@ -310,9 +329,16 @@ class RAGPipeline:
                     "from_cache": True,
                 }
 
+        # ---- 第 0.5 步：多轮问题重写（有历史时，结合上下文把问题改写成独立完整问题） ----
+        rewritten_question = question
+        if history and getattr(settings, "QUERY_REWRITE_ENABLED", True):
+            rewritten_question = await self._arewrite_question(question, history)
+            if rewritten_question and rewritten_question != question:
+                logger.info(f"问题重写: '{question[:50]}' → '{rewritten_question[:60]}'")
+
         # ---- 第 1~2 步：检索 + 组装提示（异步） ----
         prepared = await self._aprepare_query(
-            question=question,
+            question=rewritten_question,
             k=k,
             concise=concise,
             filter_criteria=filter_criteria,
@@ -343,6 +369,10 @@ class RAGPipeline:
                 logger.info(
                     f"回答生成完成(异步)（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
                 )
+                # 生成相关问题推荐（基于检索到的知识库文档）
+                related = []
+                if prepared["retrieved_docs"] and getattr(settings, "RELATED_QUESTIONS_ENABLED", True):
+                    related = await self._arelate_questions(question, answer)
                 if not history:
                     cache_tags = [
                         f"doc:{s.get('filename', '')}"
@@ -360,6 +390,7 @@ class RAGPipeline:
                     "answer_type": prepared["answer_type"],
                     "stream": False,
                     "from_cache": False,
+                    "related_questions": related,
                 }
 
         except Exception as e:
@@ -429,13 +460,21 @@ class RAGPipeline:
         if kb_chunk_count > 0:
             logger.info(f"知识库中有 {kb_chunk_count} 个文档块，尝试向量检索...")
             try:
-                # 阶段 1：向量粗召回（候选放宽，避免漏掉真正相关块）
+                # 阶段 1：粗召回（候选放宽）。启用混合检索时用 向量+关键词 融合
                 candidate_k = k or settings.RETRIEVAL_CANDIDATE_K
-                candidates = self.vector_store.similarity_search(
-                    query=question,
-                    k=candidate_k,
-                    filter=filter_criteria,
-                )
+                search_method = getattr(self.vector_store, "hybrid_search", None)
+                if search_method is not None and getattr(settings, "HYBRID_SEARCH_ENABLED", True):
+                    candidates = self.vector_store.hybrid_search(
+                        query=question,
+                        k=candidate_k,
+                        filter=filter_criteria,
+                    )
+                else:
+                    candidates = self.vector_store.similarity_search(
+                        query=question,
+                        k=candidate_k,
+                        filter=filter_criteria,
+                    )
                 # 阶段 2：重排精排，取最终 top-k
                 final_k = min(k or settings.RETRIEVAL_TOP_K, len(candidates)) if candidates else 0
                 retrieved_docs = self.reranker.rerank(
@@ -483,13 +522,21 @@ class RAGPipeline:
         if kb_chunk_count > 0:
             logger.info(f"知识库中有 {kb_chunk_count} 个文档块，尝试向量检索(异步)...")
             try:
-                # 阶段 1：向量粗召回（候选放宽）
+                # 阶段 1：粗召回（候选放宽）。启用混合检索时用 向量+关键词 融合
                 candidate_k = k or settings.RETRIEVAL_CANDIDATE_K
-                candidates = await self.vector_store.asimilarity_search(
-                    query=question,
-                    k=candidate_k,
-                    filter=filter_criteria,
-                )
+                search_method = getattr(self.vector_store, "ahybrid_search", None)
+                if search_method is not None and getattr(settings, "HYBRID_SEARCH_ENABLED", True):
+                    candidates = await self.vector_store.ahybrid_search(
+                        query=question,
+                        k=candidate_k,
+                        filter=filter_criteria,
+                    )
+                else:
+                    candidates = await self.vector_store.asimilarity_search(
+                        query=question,
+                        k=candidate_k,
+                        filter=filter_criteria,
+                    )
                 # 阶段 2：重排精排，取最终 top-k
                 final_k = min(k or settings.RETRIEVAL_TOP_K, len(candidates)) if candidates else 0
                 retrieved_docs = self.reranker.rerank(
@@ -595,6 +642,136 @@ class RAGPipeline:
             f"（文档级阈值: {doc_threshold:.2f}, 最高分: {filtered[0].get('score', 0):.3f}）"
         )
         return filtered, True
+
+    # ================================================================
+    # 多轮问题重写
+    # ================================================================
+
+    REWRITE_SYSTEM_PROMPT = """你是一个对话上下文理解助手。根据用户的多轮对话历史，
+把最新的用户问题改写成一个【独立的、完整的、无指代】的问题，使其不依赖上下文也能被搜索引擎/知识库理解。
+
+规则：
+- 保留原问题的意图与信息
+- 把指代词（它、这、那、这个、那里、怎么、如何等）替换成历史中明确提到的具体对象
+- 如果问题本身已经完整独立，原样返回
+- 只返回改写后的问题本身，不要任何解释、标点包裹或多余文字"""
+
+    async def _arewrite_question(self, question: str, history: list[dict[str, str]]) -> str:
+        """用 LLM 把多轮问题重写成独立完整问题（异步）。"""
+        try:
+            # 构造最近的对话摘要（最多取最近 6 条）
+            recent = history[-6:]
+            history_text = "\n".join(
+                f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')}"
+                for m in recent
+            )
+            prompt = (
+                f"对话历史：\n{history_text}\n\n"
+                f"当前问题：{question}\n\n"
+                f"改写后的独立问题："
+            )
+            rewritten = await self.llm.agenerate(
+                prompt=prompt,
+                system_prompt=self.REWRITE_SYSTEM_PROMPT,
+                max_tokens=100,
+                temperature=0.0,
+            )
+            rewritten = rewritten.strip().strip('"').strip("'").strip()
+            return rewritten if rewritten else question
+        except Exception as e:
+            logger.warning(f"问题重写失败，使用原问题: {e}")
+            return question
+
+    def _rewrite_question(self, question: str, history: list[dict[str, str]]) -> str:
+        """用 LLM 把多轮问题重写成独立完整问题（同步）。"""
+        try:
+            recent = history[-6:]
+            history_text = "\n".join(
+                f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')}"
+                for m in recent
+            )
+            prompt = (
+                f"对话历史：\n{history_text}\n\n"
+                f"当前问题：{question}\n\n"
+                f"改写后的独立问题："
+            )
+            rewritten = self.llm.generate(
+                prompt=prompt,
+                system_prompt=self.REWRITE_SYSTEM_PROMPT,
+                max_tokens=100,
+                temperature=0.0,
+            )
+            rewritten = rewritten.strip().strip('"').strip("'").strip()
+            return rewritten if rewritten else question
+        except Exception as e:
+            logger.warning(f"问题重写失败，使用原问题: {e}")
+            return question
+
+    # ================================================================
+    # 相关问题推荐
+    # ================================================================
+
+    RELATED_SYSTEM_PROMPT = """你是知识库问答助手。根据用户的当前问题和回答内容，
+生成 2~3 个相关的后续问题，帮助用户深入探索。
+
+规则：
+- 只生成与当前话题强相关、且知识库/文档可能覆盖的问题
+- 每个问题独立成行，用数字开头（如：1. xxx）
+- 不要生成与当前问题重复的问题
+- 只返回问题列表，不要其他文字"""
+
+    async def _arelate_questions(self, question: str, answer: str) -> list[str]:
+        """基于当前问题和回答生成相关问题（异步）。"""
+        try:
+            prompt = (
+                f"用户问题：{question}\n\n"
+                f"回答内容：{answer[:1500]}\n\n"
+                f"相关后续问题："
+            )
+            resp = await self.llm.agenerate(
+                prompt=prompt,
+                system_prompt=self.RELATED_SYSTEM_PROMPT,
+                max_tokens=200,
+                temperature=0.6,
+            )
+            return self._parse_related(resp)
+        except Exception as e:
+            logger.warning(f"生成相关问题失败: {e}")
+            return []
+
+    def _relate_questions(self, question: str, answer: str) -> list[str]:
+        """基于当前问题和回答生成相关问题（同步）。"""
+        try:
+            prompt = (
+                f"用户问题：{question}\n\n"
+                f"回答内容：{answer[:1500]}\n\n"
+                f"相关后续问题："
+            )
+            resp = self.llm.generate(
+                prompt=prompt,
+                system_prompt=self.RELATED_SYSTEM_PROMPT,
+                max_tokens=200,
+                temperature=0.6,
+            )
+            return self._parse_related(resp)
+        except Exception as e:
+            logger.warning(f"生成相关问题失败: {e}")
+            return []
+
+    @staticmethod
+    def _parse_related(resp: str) -> list[str]:
+        """解析 LLM 返回的相关问题列表。"""
+        questions = []
+        for line in resp.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 去掉 "1. " / "1、" / "1." 前缀
+            import re
+            cleaned = re.sub(r"^\d+[\.、]\s*", "", line).strip()
+            if cleaned and cleaned not in questions:
+                questions.append(cleaned)
+        return questions[:3]
 
     def _build_prompt(
         self,
@@ -749,12 +926,12 @@ class RAGPipeline:
 
     @staticmethod
     def _format_context(documents: list[dict[str, Any]]) -> str:
-        """将检索到的文档块格式化为提示上下文"""
+        """将检索到的文档块格式化为提示上下文，带 [N] 编号供回答引用。"""
         sections = []
         for i, doc in enumerate(documents, 1):
             source = doc.get("metadata", {}).get("filename", "未知来源")
             content = doc.get("content", "")
-            sections.append(f"[文档 {i}] (来源: {source})\n{content}\n")
+            sections.append(f"[{i}] (来源: {source})\n{content}\n")
         return "\n---\n".join(sections)
 
     @staticmethod
@@ -798,12 +975,13 @@ class RAGPipeline:
                 "chunk_index": meta.get("chunk_index"),
             })
 
-        # 按文档最高分降序排列来源
+        # 按文档最高分降序排列来源，并给每个来源分配 [N] 索引（对应回答中的引用标注）
         sources = [doc_chunks[k] for k in order]
         sources.sort(key=lambda s: s["score"], reverse=True)
 
         # 每个文档内部的块按分数降序
-        for s in sources:
+        for idx, s in enumerate(sources, 1):
+            s["index"] = idx
             s["chunks"].sort(key=lambda c: c["score"], reverse=True)
 
         return sources
