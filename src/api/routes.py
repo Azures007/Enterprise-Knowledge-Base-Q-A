@@ -188,6 +188,49 @@ async def _visible_collections_for(rag, auth: dict) -> list[str]:
     return visible_collections(auth, all_raw, user_id=user_id, owner_map=owner_map)
 
 
+async def _multi_collection_search(
+    rag,
+    question: str,
+    collections: list[str],
+    k: int,
+    filter_criteria: dict | None = None,
+) -> list[dict]:
+    """
+    多集合并行检索：对每个可见集合分别检索，合并结果取全局最优候选。
+
+    这是方案 B 的核心——不依赖 LLM 路由选集合，而是所有集合都检索，
+    从全局取最相关的候选块（可跨集合），彻底避免"路由选错集合"。
+
+    Returns:
+        合并后的候选块列表（按分数降序），每项含 content, metadata, score, collection
+    """
+    candidate_k = max(k * 2, settings.RETRIEVAL_CANDIDATE_K)  # 每集合候选放宽
+    all_candidates = []
+    for coll in collections:
+        try:
+            await rag.vector_store.aswitch_collection(coll)
+            search_method = getattr(rag.vector_store, "ahybrid_search", None)
+            if search_method is not None and getattr(settings, "HYBRID_SEARCH_ENABLED", True):
+                docs = await rag.vector_store.ahybrid_search(
+                    query=question, k=candidate_k, filter=filter_criteria,
+                )
+            else:
+                docs = await rag.vector_store.asimilarity_search(
+                    query=question, k=candidate_k, filter=filter_criteria,
+                )
+            for d in docs:
+                d.setdefault("metadata", {})
+                d["metadata"]["_collection"] = coll  # 标记来源集合
+            all_candidates.extend(docs)
+            logger.info(f"集合 '{coll}' 检索到 {len(docs)} 个候选")
+        except Exception as e:
+            logger.warning(f"集合 '{coll}' 检索失败: {e}")
+
+    # 按分数降序，取全局 top-k
+    all_candidates.sort(key=lambda d: d.get("score", 0), reverse=True)
+    return all_candidates[:k]
+
+
 async def _resolve_upload_collection(rag, auth: dict, requested: str | None) -> str:
     """
     解析上传文档的目标集合。
@@ -557,22 +600,25 @@ async def query_knowledge_base(
             raise HTTPException(status_code=500, detail=f"问答服务异常: {e}")
 
     if collection_name and collection_name in all_collections:
-        # 用户指定了集合
+        # 用户指定了集合 → 单集合检索
         target_collection = collection_name
+        await rag.vector_store.aswitch_collection(target_collection)
+        prefetched = None
     elif len(all_collections) == 1:
         # 只有一个集合，直接使用
         target_collection = all_collections[0]
+        await rag.vector_store.aswitch_collection(target_collection)
+        prefetched = None
     else:
-        # 多个集合，自动路由
-        target_collection = await _auto_route_collection(question, all_collections, rag)
-
-    # 自动路由无法确定时，回退到第一个有内容的集合（而非直接报错让用户手动选）
-    if target_collection is None:
-        target_collection = all_collections[0]
-        logger.info(f"自动路由未确定，回退到集合 '{target_collection}'")
-
-    # 切换到目标集合
-    await rag.vector_store.aswitch_collection(target_collection)
+        # 多集合 → 方案 B：所有集合并行检索，取全局最优（不依赖 LLM 路由）
+        target_collection = None  # 跨集合，无单一目标集合
+        candidate_k = (k or settings.RETRIEVAL_TOP_K) * 2
+        prefetched = await _multi_collection_search(
+            rag, question, all_collections, candidate_k, filter_criteria
+        )
+        if not prefetched:
+            # 所有集合都检索不到，回退通用知识
+            target_collection = None
 
     try:
         result = await rag.aquery(
@@ -582,6 +628,7 @@ async def query_knowledge_base(
             concise=concise,
             filter_criteria=filter_criteria,
             history=history or None,
+            prefetched_docs=prefetched,
         )
         answer = result["answer"]
         sources = [SourceInfo(**s) for s in result["sources"]]
@@ -702,20 +749,22 @@ async def query_knowledge_base_stream(
 
         return StreamingResponse(empty_kb_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
+    prefetched = None
     if collection_name and collection_name in all_collections:
+        # 用户指定了集合 → 单集合检索
         target_collection = collection_name
+        await rag.vector_store.aswitch_collection(target_collection)
     elif len(all_collections) == 1:
+        # 只有一个集合，直接使用
         target_collection = all_collections[0]
+        await rag.vector_store.aswitch_collection(target_collection)
     else:
-        target_collection = await _auto_route_collection(question, all_collections, rag)
-
-    # 自动路由无法确定时，回退到第一个有内容的集合（而非报错）
-    if target_collection is None:
-        target_collection = all_collections[0]
-        logger.info(f"自动路由未确定(流式)，回退到集合 '{target_collection}'")
-
-    # 切换到目标集合
-    await rag.vector_store.aswitch_collection(target_collection)
+        # 多集合 → 方案 B：所有集合并行检索（不依赖 LLM 路由）
+        target_collection = None
+        candidate_k = (k or settings.RETRIEVAL_TOP_K) * 2
+        prefetched = await _multi_collection_search(
+            rag, question, all_collections, candidate_k, filter_criteria
+        )
 
     async def event_generator():
         """SSE 事件生成器"""
@@ -725,6 +774,7 @@ async def query_knowledge_base_stream(
                 k=k,
                 concise=concise,
                 history=history or None,
+                prefetched_docs=prefetched,
             )
             sources = result["sources"]
             answer_type = result.get("answer_type", "general")

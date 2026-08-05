@@ -303,11 +303,16 @@ class RAGPipeline:
         concise: bool = False,
         filter_criteria: dict[str, Any] | None = None,
         history: list[dict[str, str]] | None = None,
+        prefetched_docs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         异步执行一次混合问答（用于 FastAPI 事件循环，不阻塞其他请求）。
 
         接口语义与 query() 完全一致。
+
+        Args:
+            prefetched_docs: 可选的预检索候选块（跨集合检索时由路由层传入，
+                管线跳过内部检索直接走重排+过滤）。
         """
         if not question or not question.strip():
             raise RAGPipelineError("问题不能为空")
@@ -342,6 +347,7 @@ class RAGPipeline:
             k=k,
             concise=concise,
             filter_criteria=filter_criteria,
+            prefetched_docs=prefetched_docs,
         )
 
         # ---- 第 3 步：LLM 生成（异步） ----
@@ -423,6 +429,7 @@ class RAGPipeline:
         concise: bool = False,
         filter_criteria: dict[str, Any] | None = None,
         history: list[dict[str, str]] | None = None,
+        prefetched_docs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         异步流式混合问答的快捷方式。
@@ -434,6 +441,7 @@ class RAGPipeline:
             concise=concise,
             filter_criteria=filter_criteria,
             history=history,
+            prefetched_docs=prefetched_docs,
         )
 
     # ================================================================
@@ -513,13 +521,32 @@ class RAGPipeline:
         k: int | None = None,
         concise: bool = False,
         filter_criteria: dict[str, Any] | None = None,
+        prefetched_docs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """执行向量检索并组装系统提示词（异步路径）。"""
+        """执行检索并组装系统提示词（异步路径）。
+
+        Args:
+            prefetched_docs: 预检索的候选块（跨集合检索时由路由层传入）。
+                传入时跳过内部检索，直接重排+过滤。
+        """
         kb_chunk_count = await self.vector_store.acount()
         retrieved_docs = []
         has_relevant_docs = False
 
-        if kb_chunk_count > 0:
+        if prefetched_docs:
+            # 预检索模式：跳过内部检索，直接重排精排
+            logger.info(f"使用预检索结果: {len(prefetched_docs)} 个候选块(异步)")
+            try:
+                final_k = min(k or settings.RETRIEVAL_TOP_K, len(prefetched_docs))
+                retrieved_docs = self.reranker.rerank(
+                    query=question,
+                    candidates=prefetched_docs,
+                    top_k=final_k,
+                )
+            except Exception as e:
+                logger.warning(f"预检索结果重排失败(异步)，使用原始候选: {e}")
+                retrieved_docs = prefetched_docs[:k or settings.RETRIEVAL_TOP_K]
+        elif kb_chunk_count > 0:
             logger.info(f"知识库中有 {kb_chunk_count} 个文档块，尝试向量检索(异步)...")
             try:
                 # 阶段 1：粗召回（候选放宽）。启用混合检索时用 向量+关键词 融合
