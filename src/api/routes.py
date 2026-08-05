@@ -1430,12 +1430,10 @@ async def get_stats(
     auth: dict = Depends(require_auth),
 ):
     """获取当前用户可见范围内的知识库统计信息（管理员为全局）"""
-    # 只统计用户可见集合（普通用户看不到全库数据，避免信息泄露）
+    # 一次 SQL 聚合用户可见集合的统计，避免逐集合循环查询
     visible = await _visible_collections_for(rag, auth)
-    total_chunks = 0
-    for name in visible:
-        await rag.vector_store.aswitch_collection(name)
-        total_chunks += await rag.vector_store.acount()
+    stats_rows = await rag.vector_store.aget_collection_stats(visible)
+    total_chunks = sum(r["chunk_count"] for r in stats_rows)
 
     stats = await rag.aget_knowledge_base_stats()
     stats["total_chunks"] = total_chunks
@@ -1454,15 +1452,16 @@ async def list_collections(
 ):
     """列出当前用户可见的知识库集合及其文档数量（管理员可见全部）"""
     names = await _visible_collections_for(rag, auth)
-    # 获取每个集合的详细信息
-    detailed = []
-    for name in names:
-        await rag.vector_store.aswitch_collection(name)
-        detailed.append({
-            "name": name,
-            "chunk_count": await rag.vector_store.acount(),
-            "document_count": len(await rag.vector_store.alist_documents()),
-        })
+    # 一次 SQL 聚合所有可见集合的统计
+    stats_rows = await rag.vector_store.aget_collection_stats(names)
+    detailed = [
+        {
+            "name": r["name"],
+            "chunk_count": r["chunk_count"],
+            "document_count": r["document_count"],
+        }
+        for r in stats_rows
+    ]
     return {
         "code": 0,
         "message": "success",

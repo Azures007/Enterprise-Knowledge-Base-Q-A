@@ -471,6 +471,50 @@ class PGVectorStore:
         await self._aensure_collection(self.collection_name)
         logger.info(f"已切换到集合 '{collection_name}'")
 
+    async def aget_collection_stats(self, names: list[str] | None = None) -> list[dict]:
+        """
+        一次 SQL 聚合多个集合的统计信息（chunk 数、文档数）。
+
+        Args:
+            names: 需要统计的集合名列表；None 表示全部集合
+
+        Returns:
+            list[dict]: 每项含 name, chunk_count, document_count
+        """
+        async with (await self._aconn()).acquire() as conn:
+            if names:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        c.name,
+                        (SELECT COUNT(*) FROM chunks ch WHERE ch.collection_id = c.id) AS chunk_count,
+                        (SELECT COUNT(*) FROM documents d WHERE d.collection_id = c.id) AS document_count
+                    FROM collections c
+                    WHERE c.name = ANY($1)
+                    ORDER BY c.name
+                    """,
+                    names,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        c.name,
+                        (SELECT COUNT(*) FROM chunks ch WHERE ch.collection_id = c.id) AS chunk_count,
+                        (SELECT COUNT(*) FROM documents d WHERE d.collection_id = c.id) AS document_count
+                    FROM collections c
+                    ORDER BY c.name
+                    """
+                )
+        return [
+            {
+                "name": r["name"],
+                "chunk_count": r["chunk_count"],
+                "document_count": r["document_count"],
+            }
+            for r in rows
+        ]
+
     async def arenmae_collection(self, old_name: str, new_name: str) -> bool:
         """重命名集合"""
         async with (await self._aconn()).acquire() as conn:
