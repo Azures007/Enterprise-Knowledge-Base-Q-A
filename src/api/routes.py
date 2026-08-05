@@ -496,8 +496,17 @@ async def query_knowledge_base(
     # ---- 加载多轮对话历史（按 token 预算动态截断） ----
     history = await _load_conversation_history(mgr, conversation_id, user_id)
 
-    # ---- 自动路由：确定查询哪个集合（仅限当前用户可见集合） ----
+    # ---- 自动路由：确定查询哪个集合（仅限当前用户可见且有内容的集合） ----
     all_collections = await _visible_collections_for(rag, auth)
+    # 过滤掉空集合（chunk_count=0），避免自动路由到无内容集合导致误判"知识库为空"
+    if len(all_collections) > 1:
+        try:
+            coll_stats = await rag.vector_store.aget_collection_stats(all_collections)
+            non_empty = [s["name"] for s in coll_stats if s["chunk_count"] > 0]
+            if non_empty:
+                all_collections = non_empty
+        except Exception as e:
+            logger.warning(f"过滤空集合失败，使用全部可见集合: {e}")
 
     # 知识库为空时，直接走 RAG 管线（其内部会使用通用知识回答并提示上传）
     if not all_collections:
@@ -557,21 +566,10 @@ async def query_knowledge_base(
         # 多个集合，自动路由
         target_collection = await _auto_route_collection(question, all_collections, rag)
 
+    # 自动路由无法确定时，回退到第一个有内容的集合（而非直接报错让用户手动选）
     if target_collection is None:
-        # 自动路由无法确定，提示用户手动选择
-        coll_list = "、".join(all_collections)
-        return APIResponse(
-            code=0,
-            message="success",
-            data=QueryResponseData(
-                question=question,
-                answer=f"无法确定您的问题属于哪个知识库。当前可用的集合有：{coll_list}。请手动选择对应的集合后重新提问。",
-                sources=[],
-                answer_type="routing_failed",
-                collection=None,
-                stats=QueryStats(retrieved_chunks=0, unique_sources=0),
-            ),
-        )
+        target_collection = all_collections[0]
+        logger.info(f"自动路由未确定，回退到集合 '{target_collection}'")
 
     # 切换到目标集合
     await rag.vector_store.aswitch_collection(target_collection)
@@ -647,8 +645,17 @@ async def query_knowledge_base_stream(
     # ---- 加载多轮对话历史（按 token 预算动态截断） ----
     history = await _load_conversation_history(mgr, conversation_id, user_id)
 
-    # ---- 自动路由：确定查询哪个集合（仅限当前用户可见集合） ----
+    # ---- 自动路由：确定查询哪个集合（仅限当前用户可见且有内容的集合） ----
     all_collections = await _visible_collections_for(rag, auth)
+    # 过滤掉空集合（chunk_count=0），避免自动路由到无内容集合导致误判"知识库为空"
+    if len(all_collections) > 1:
+        try:
+            coll_stats = await rag.vector_store.aget_collection_stats(all_collections)
+            non_empty = [s["name"] for s in coll_stats if s["chunk_count"] > 0]
+            if non_empty:
+                all_collections = non_empty
+        except Exception as e:
+            logger.warning(f"过滤空集合失败，使用全部可见集合: {e}")
 
     # 知识库为空时，直接走 RAG 管线（其内部会使用通用知识回答并提示上传）
     if not all_collections:
@@ -702,12 +709,10 @@ async def query_knowledge_base_stream(
     else:
         target_collection = await _auto_route_collection(question, all_collections, rag)
 
+    # 自动路由无法确定时，回退到第一个有内容的集合（而非报错）
     if target_collection is None:
-        coll_list = "、".join(all_collections)
-        async def routing_failed_generator():
-            yield f"data: {json.dumps({'type': 'meta', 'sources': [], 'answer_type': 'routing_failed'}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'data': f'无法确定您的问题属于哪个知识库。当前可用的集合有：{coll_list}。请手动选择对应的集合后重新提问。'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(routing_failed_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        target_collection = all_collections[0]
+        logger.info(f"自动路由未确定(流式)，回退到集合 '{target_collection}'")
 
     # 切换到目标集合
     await rag.vector_store.aswitch_collection(target_collection)
