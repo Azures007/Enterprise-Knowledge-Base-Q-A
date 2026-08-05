@@ -688,6 +688,8 @@ async def query_knowledge_base_stream(
     collection_name = body.collection
     conversation_id = body.conversation_id
     user_id = await _resolve_user_id(mgr, auth)
+    # 流式请求体没有 filter 字段，多集合检索的 filter_criteria 固定为 None
+    filter_criteria = None
 
     # ---- 加载多轮对话历史（按 token 预算动态截断） ----
     history = await _load_conversation_history(mgr, conversation_id, user_id)
