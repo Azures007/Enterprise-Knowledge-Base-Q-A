@@ -709,6 +709,12 @@ async def query_knowledge_base(
             target_collection = None
 
     try:
+        # 工具模式启用时，不传 prefetched_docs，让管线内部走 Agentic 检索
+        # （工具模式闸门条件是 not prefetched_docs）
+        tool_mode = (
+            getattr(settings, "TOOL_CALLING_ENABLED", False)
+            and getattr(rag, "tool_executor", None) is not None
+        )
         result = await rag.aquery(
             question=question,
             k=k,
@@ -716,7 +722,7 @@ async def query_knowledge_base(
             concise=concise,
             filter_criteria=filter_criteria,
             history=history or None,
-            prefetched_docs=prefetched,
+            prefetched_docs=None if tool_mode else prefetched,
         )
         answer = result["answer"]
         sources = [SourceInfo(**s) for s in result["sources"]]
@@ -930,12 +936,17 @@ async def query_knowledge_base_stream(
     async def event_generator():
         """SSE 事件生成器"""
         try:
+            # 工具模式启用时，不传 prefetched_docs，让管线内部走 Agentic 检索
+            tool_mode = (
+                getattr(settings, "TOOL_CALLING_ENABLED", False)
+                and getattr(rag, "tool_executor", None) is not None
+            )
             result = await rag.astream_query(
                 question=question,
                 k=k,
                 concise=concise,
                 history=history or None,
-                prefetched_docs=prefetched,
+                prefetched_docs=None if tool_mode else prefetched,
             )
             sources = result["sources"]
             answer_type = result.get("answer_type", "general")
