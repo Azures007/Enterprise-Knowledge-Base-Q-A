@@ -660,7 +660,11 @@ class RAGPipeline:
             "你是一个企业知识库智能助手。你可以调用工具来获取信息："
             "需要查阅知识库文档时调用 search_knowledge_base（并先 list_collections 了解有哪些集合）；"
             "询问时间/计算/知识库统计时调用对应工具。"
-            "基于工具返回的内容回答，引用来源时标注 [N]。"
+            "引用规则：只有当工具返回的内容包含知识库文档（如 search_knowledge_base 的"
+            " results 里带 filename/source）时，回答中才需要标注来源编号 [N]，"
+            "且 N 必须对应工具返回中实际存在的来源；"
+            "如果回答完全基于工具数据（如天气、时间、计算）而未引用任何知识库文档，"
+            "则绝对不要在回答中添加任何 [N] 标注。"
         )
         messages: list[dict[str, str]] = [{"role": "system", "content": tool_system_prompt}]
         if history:
@@ -682,8 +686,14 @@ class RAGPipeline:
         # 汇总工具检索到的来源（从 tool 消息中提取 search_knowledge_base 的结果）
         sources = self._extract_tool_sources(result.get("messages", []))
 
+        answer = result.get("content", "")
+        # 兜底清洗：sources 为空（如纯天气/时间回答）时，剥掉回答里的 [N] 引用标记，
+        # 避免 LLM 幻觉出不存在的来源编号
+        if not sources:
+            answer = self._strip_citations(answer)
+
         return {
-            "answer": result.get("content", ""),
+            "answer": answer,
             "sources": sources,
             "context": [],  # 工具模式上下文由工具结果承载
             "answer_type": "tool" if sources else "general",
@@ -693,6 +703,22 @@ class RAGPipeline:
             "related_questions": [],
             "tool_calls": result.get("tool_calls", []),
         }
+
+    @staticmethod
+    def _strip_citations(text: str) -> str:
+        """
+        剥除回答中的 [N] 引用标记（无来源时兜底）。
+
+        只匹配"独立的、单个数字的引用标记"，即 [1]、[2] 或连续多个 [1][2]。
+        不匹配数组（[1,2,3]）、小数（[5.0]）、负号（[-3]）等数值内容，
+        避免误删正文里的数学表达。
+        """
+        import re
+
+        if not text:
+            return text
+        # 仅匹配括号内为纯数字（无逗号/点/负号）的引用标记，连续多个也一并删除
+        return re.sub(r"\[\d+\]", "", text)
 
     @staticmethod
     def _extract_tool_sources(messages: list[dict]) -> list[dict]:
