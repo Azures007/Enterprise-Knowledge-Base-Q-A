@@ -42,6 +42,84 @@ SCORE_THRESHOLD = 0.35
 from src.cache import qa_cache
 
 
+def _safe_json_loads(content: str):
+    """
+    容错解析工具结果 JSON。
+
+    工具结果可能被截断（result_limit），导致 json.loads 失败。
+    策略（从易到难）：
+        1. 直接 json.loads
+        2. 去掉尾部截断标记
+        3. 在截断边界处做括号配平补全（补闭合的 ]/}/字符串）
+        4. json.JSONDecoder.raw_decode 取头部完整 JSON
+    """
+    import json
+
+    if not content:
+        return None
+    # 1. 直接解析
+    try:
+        return json.loads(content)
+    except (ValueError, TypeError):
+        pass
+
+    # 去掉截断标记与尾部逗号
+    cleaned = content
+    for marker in ('..."(已截断)"', '"(已截断)"', '..."', '...'):
+        if cleaned.endswith(marker):
+            cleaned = cleaned[: -len(marker)].rstrip().rstrip(",")
+            break
+
+    # 2. 括号配平补全：从截断点往回，逐字符移除不完整的 token，
+    #    直到剩余内容括号配平且可解析
+    for cut in range(len(cleaned), 0, -1):
+        candidate = cleaned[:cut]
+        # 括号配平检查（忽略字符串内的括号，粗略即可）
+        stack = []
+        in_str = False
+        escape = False
+        for ch in candidate:
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "[{":
+                stack.append(ch)
+            elif ch in "]}":
+                if stack:
+                    stack.pop()
+        # 栈里只剩未闭合的 [ 和 {，补全闭合即可
+        if stack and all(c in "[{" for c in stack):
+            suffix = ""
+            for c in reversed(stack):
+                suffix += "]" if c == "[" else "}"
+            try:
+                return json.loads(candidate + suffix)
+            except (ValueError, TypeError):
+                continue
+        if not stack:
+            # 已配平但仍解析失败（可能截断在值中间），继续往前找
+            try:
+                return json.loads(candidate)
+            except (ValueError, TypeError):
+                continue
+
+    # 3. raw_decode 取头部完整 JSON 对象
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(content.lstrip())
+        if isinstance(obj, dict):
+            return obj
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 class RAGPipelineError(Exception):
     """RAG 管线运行异常"""
     pass
@@ -144,6 +222,24 @@ class RAGPipeline:
         # 重排器（用于检索后精排）
         from src.reranker import Reranker
         self.reranker = Reranker()
+
+        # 工具调用执行器（Agentic 检索，开关启用）
+        self.tool_executor = None
+        if getattr(settings, "TOOL_CALLING_ENABLED", False):
+            try:
+                from src.tools import ToolExecutor, ToolRegistry
+                from src.tools.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
+
+                self.tool_registry = ToolRegistry(TOOL_DEFINITIONS, TOOL_HANDLERS)
+                self.tool_executor = ToolExecutor(
+                    self.llm,
+                    self.tool_registry,
+                    max_rounds=getattr(settings, "TOOL_CALLING_MAX_ROUNDS", 4),
+                    result_limit=getattr(settings, "TOOL_CALLING_RESULT_LIMIT", 2000),
+                )
+                logger.info("工具调用已启用（Agentic 检索）")
+            except Exception as e:
+                logger.warning(f"工具调用初始化失败，退回标准检索: {e}")
 
         self._total_queries = 0
         self._total_tokens_estimate = 0
@@ -348,6 +444,39 @@ class RAGPipeline:
             if rewritten_question and rewritten_question != question:
                 logger.info(f"问题重写: '{question[:50]}' → '{rewritten_question[:60]}'")
 
+        # ---- 第 0.75 步：工具调用模式（Agentic 检索） ----
+        # 开关启用且有执行器时走工具模式；跨集合预检索(prefetched_docs)时不走，
+        # 避免与路由层的方案 B 检索冲突
+        if (
+            not stream
+            and self.tool_executor is not None
+            and not prefetched_docs
+            and getattr(settings, "TOOL_CALLING_ENABLED", False)
+        ):
+            logger.info(f"走工具调用模式: {question[:80]}")
+            try:
+                tool_result = await self._atool_call_query(
+                    question=rewritten_question,
+                    k=k,
+                    concise=concise,
+                    history=history,
+                    is_admin=False,
+                )
+                # 缓存（非流式、无历史）
+                if not history:
+                    cache_tags = [
+                        f"doc:{s.get('filename', '')}"
+                        for s in tool_result["sources"] if s.get("filename")
+                    ]
+                    qa_cache.set(question, {
+                        "answer": tool_result["answer"],
+                        "sources": tool_result["sources"],
+                        "answer_type": tool_result["answer_type"],
+                    }, tags=cache_tags)
+                return tool_result
+            except Exception as e:
+                logger.warning(f"工具调用模式失败，退回标准检索: {e}")
+
         # ---- 第 1~2 步：检索 + 组装提示（异步） ----
         prepared = await self._aprepare_query(
             question=rewritten_question,
@@ -445,7 +574,43 @@ class RAGPipeline:
     ) -> dict[str, Any]:
         """
         异步流式混合问答的快捷方式。
+
+        工具调用模式开启时，工具循环在内部非流式完成，最终回答以流式片段返回。
         """
+        # 工具调用模式：流式路径也在内部完成工具循环，再以生成器形式返回回答
+        if (
+            self.tool_executor is not None
+            and not prefetched_docs
+            and getattr(settings, "TOOL_CALLING_ENABLED", False)
+        ):
+            try:
+                tool_result = await self._atool_call_query(
+                    question=question,
+                    k=k,
+                    concise=concise,
+                    history=history,
+                    is_admin=False,
+                )
+                content = tool_result["answer"]
+
+                async def tool_stream():
+                    # 分段产出最终回答（模拟流式；工具循环本身已非流式完成）
+                    chunk_size = 20
+                    for i in range(0, len(content), chunk_size):
+                        yield content[i : i + chunk_size]
+
+                return {
+                    "answer": tool_stream(),
+                    "sources": tool_result["sources"],
+                    "context": [],
+                    "answer_type": tool_result["answer_type"],
+                    "stream": True,
+                    "usage": tool_result.get("usage", {}),
+                    "tool_calls": tool_result.get("tool_calls", []),
+                }
+            except Exception as e:
+                logger.warning(f"工具调用模式失败(流式)，退回标准检索: {e}")
+
         return await self.aquery(
             question=question,
             k=k,
@@ -455,6 +620,136 @@ class RAGPipeline:
             history=history,
             prefetched_docs=prefetched_docs,
         )
+
+    # ================================================================
+    # Agentic 检索（工具调用模式）
+    # ================================================================
+
+    async def _atool_call_query(
+        self,
+        question: str,
+        k: int | None = None,
+        concise: bool = False,
+        history: list[dict[str, str]] | None = None,
+        is_admin: bool = False,
+    ) -> dict[str, Any]:
+        """
+        工具调用模式的问答：让 LLM 自主决定调用哪些工具（列集合、检索知识库、查统计），
+        工具结果作为上下文生成带引用的回答。
+
+        Args:
+            question:  用户问题
+            k:         检索块数量（传给 search_knowledge_base 工具）
+            concise:   是否简洁回答
+            history:   多轮对话历史
+            is_admin:  是否管理员（决定管理工具是否可用）
+
+        Returns:
+            dict（与 aquery 返回结构一致）:
+                - answer / sources / context / answer_type / usage / tool_calls
+        """
+        if self.tool_executor is None:
+            raise RAGPipelineError("工具调用未启用")
+
+        # 构造初始消息：系统提示 + 历史 + 当前问题
+        system_prompt = (
+            self.CONCISE_SYSTEM_PROMPT if concise else self.DEFAULT_SYSTEM_PROMPT
+        )
+        # 工具模式下 context 由工具注入，初始提示不含文档上下文
+        tool_system_prompt = (
+            "你是一个企业知识库智能助手。你可以调用工具来获取信息："
+            "需要查阅知识库文档时调用 search_knowledge_base（并先 list_collections 了解有哪些集合）；"
+            "询问时间/计算/知识库统计时调用对应工具。"
+            "基于工具返回的内容回答，引用来源时标注 [N]。"
+        )
+        messages: list[dict[str, str]] = [{"role": "system", "content": tool_system_prompt}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": question})
+
+        # 工具上下文：注入当前 RAG 管线与检索参数
+        ctx = {
+            "rag": self,
+            "vector_store": self.vector_store,
+            "reranker": self.reranker,
+            "default_k": k or settings.RETRIEVAL_TOP_K,
+        }
+
+        result = await self.tool_executor.run(
+            messages, ctx, tools=None, is_admin=is_admin
+        )
+
+        # 汇总工具检索到的来源（从 tool 消息中提取 search_knowledge_base 的结果）
+        sources = self._extract_tool_sources(result.get("messages", []))
+
+        return {
+            "answer": result.get("content", ""),
+            "sources": sources,
+            "context": [],  # 工具模式上下文由工具结果承载
+            "answer_type": "tool" if sources else "general",
+            "stream": False,
+            "from_cache": False,
+            "usage": result.get("usage", {}),
+            "related_questions": [],
+            "tool_calls": result.get("tool_calls", []),
+        }
+
+    @staticmethod
+    def _extract_tool_sources(messages: list[dict]) -> list[dict]:
+        """
+        从工具循环的完整消息序列中提取检索来源。
+
+        优先读取工具结果里的精简 sources 摘要字段（不受截断影响）；
+        摘要缺失时回退到解析完整 results。
+        """
+        sources: dict[str, dict] = {}
+        order: list[str] = []
+
+        for msg in messages:
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            data = _safe_json_loads(content)
+            if not isinstance(data, dict):
+                continue
+            # 优先使用精简摘要（search_knowledge_base 返回）
+            src_list = data.get("sources") if isinstance(data.get("sources"), list) else None
+            # 回退：从 results 构建
+            if not src_list and isinstance(data.get("results"), list):
+                src_list = []
+                for r in data["results"]:
+                    src_list.append({
+                        "filename": r.get("filename", ""),
+                        "source": r.get("source") or r.get("filename", ""),
+                        "score": r.get("score", 0),
+                        "page": r.get("page"),
+                        "collection": r.get("collection"),
+                    })
+            if not src_list:
+                continue
+            for r in src_list:
+                key = r.get("source") or r.get("filename") or ""
+                if not key:
+                    continue
+                if key not in sources:
+                    sources[key] = {
+                        "filename": r.get("filename", ""),
+                        "source": r.get("source", ""),
+                        "score": r.get("score", 0),
+                        "page": r.get("page"),
+                        "collection": r.get("collection"),
+                        "chunks": [],
+                    }
+                    order.append(key)
+                entry = sources[key]
+                entry["score"] = max(entry["score"], r.get("score", 0))
+
+        # 按分数降序，分配 [N] 引用编号
+        result = [sources[k] for k in order]
+        result.sort(key=lambda s: s["score"], reverse=True)
+        for idx, s in enumerate(result, 1):
+            s["index"] = idx
+        return result
 
     # ================================================================
     # 检索与提示词构建（同步/异步共享逻辑）

@@ -174,6 +174,48 @@ class BailianLLM:
         response_data = self._call_api(messages, params, stream=False)
         return self._extract_content(response_data)
 
+    def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        usage_cb=None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        带工具调用的多轮对话（非流式）。
+
+        Args:
+            messages: 消息列表
+            tools:    工具定义列表（OpenAI 兼容格式）
+            usage_cb: 可选回调，API 返回后把 token usage 传入
+            **kwargs: 可覆盖生成参数
+
+        Returns:
+            dict:
+                - content:    模型回复文本（无工具调用时）
+                - tool_calls: 工具调用列表 [{"id","type","function":{"name","arguments"}}]，无则 []
+                - message:    原始 message 对象（含 role 等）
+                - usage:      token 用量
+        """
+        params = self._get_params(**kwargs)
+        response_data = self._call_api(messages, params, stream=False, tools=tools)
+        self._notify_usage(response_data, usage_cb)
+        return self._extract_tool_response(response_data)
+
+    @staticmethod
+    def _extract_tool_response(response_data: dict[str, Any]) -> dict[str, Any]:
+        """从 API 响应中提取结构化的工具调用结果。"""
+        try:
+            message = response_data["choices"][0]["message"]
+        except (KeyError, IndexError) as e:
+            raise BailianLLMError(f"无法从响应中提取消息: {response_data}") from e
+        return {
+            "content": message.get("content", ""),
+            "tool_calls": message.get("tool_calls", []),
+            "message": message,
+            "usage": response_data.get("usage", {}),
+        }
+
     # ================================================================
     # 异步接口（用于 FastAPI 事件循环内调用，不阻塞其他请求）
     # ================================================================
@@ -244,6 +286,31 @@ class BailianLLM:
         response_data = await self._acall_api(messages, params, stream=False)
         return self._extract_content(response_data)
 
+    async def achat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        usage_cb=None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        带工具调用的多轮对话（异步，非流式）。
+
+        Args:
+            messages: 消息列表
+            tools:    工具定义列表（OpenAI 兼容格式）
+            usage_cb: 可选回调，API 返回后把 token usage 传入
+            **kwargs: 可覆盖生成参数
+
+        Returns:
+            dict: 与 chat_with_tools 相同结构
+                - content / tool_calls / message / usage
+        """
+        params = self._get_params(**kwargs)
+        response_data = await self._acall_api(messages, params, stream=False, tools=tools)
+        self._notify_usage(response_data, usage_cb)
+        return self._extract_tool_response(response_data)
+
     # ================================================================
     # 内部方法
     # ================================================================
@@ -280,6 +347,7 @@ class BailianLLM:
         messages: list[dict[str, str]],
         params: dict[str, Any],
         stream: bool = False,
+        tools: list[dict] | None = None,
     ) -> dict[str, Any]:
         """
         调用 Chat API。
@@ -288,6 +356,7 @@ class BailianLLM:
             messages: 消息列表
             params:   生成参数
             stream:   是否为流式调用
+            tools:    函数调用工具定义列表（OpenAI 兼容格式，可选）
 
         Returns:
             API 响应数据
@@ -302,6 +371,8 @@ class BailianLLM:
                     "stream": stream,
                     **params,
                 }
+                if tools:
+                    payload["tools"] = tools
 
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",
@@ -454,6 +525,7 @@ class BailianLLM:
         messages: list[dict[str, str]],
         params: dict[str, Any],
         stream: bool = False,
+        tools: list[dict] | None = None,
     ) -> dict[str, Any]:
         """
         异步调用 Chat API（与 _call_api 相同语义，使用 httpx.AsyncClient）。
@@ -462,6 +534,7 @@ class BailianLLM:
             messages: 消息列表
             params:   生成参数
             stream:   是否为流式调用
+            tools:    函数调用工具定义列表（OpenAI 兼容格式，可选）
 
         Returns:
             API 响应数据
@@ -476,6 +549,8 @@ class BailianLLM:
                     "stream": stream,
                     **params,
                 }
+                if tools:
+                    payload["tools"] = tools
 
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",

@@ -36,6 +36,7 @@
 | 👍 **用户反馈** | 对每条 AI 回答点赞/点踩（点踩可选填原因），状态持久化，为质量优化积累数据 |
 | 📊 **查询审计** | 记录每次问答的用户/问题/来源/Token 用量/延迟/缓存命中，管理员可查询与汇总统计 |
 | 💭 **多轮对话** | 对话持久化、历史 token 预算截断、LLM 问题重写（把指代问题改写成独立完整问题）、相关问题推荐 |
+| 🛠️ **工具调用** | Function Calling 支持：LLM 自主调用工具（列集合、检索知识库、查统计、时间/计算），Agentic 检索按需跨集合查询 |
 | ⚡ **流式输出** | 支持 SSE (Server-Sent Events) 流式响应，实时展示生成过程 |
 | 📚 **知识库管理** | 多集合（增删改查）、集合归属权限、文档增删、分块查看、统计查询 |
 | 👥 **用户与认证** | JWT + 静态 API Key 双认证，用户管理（管理员创建/删除/重置密码），用户级集合隔离 |
@@ -237,6 +238,11 @@ API_KEYS=                         # 静态 API Key 列表（逗号分隔，可�
 # === 缓存配置 ===
 CACHE_MAX_ENTRIES=10000           # LRU 缓存上限
 CACHE_QA_TTL=3600                 # 问答缓存 TTL（秒）
+
+# === 工具调用配置（Function Calling / Agentic 检索）===
+TOOL_CALLING_ENABLED=false        # 启用后 LLM 自主调用工具检索（默认关闭）
+TOOL_CALLING_MAX_ROUNDS=4         # 工具循环最大轮数（防死循环）
+TOOL_CALLING_RESULT_LIMIT=2000    # 工具结果截断字符数
 ```
 
 完整配置项见 [config/settings.py](config/settings.py)。
@@ -704,7 +710,10 @@ Enterprise-Knowledge-Base-Q-A/
 │   ├── llm/
 │   │   └── bailian_llm.py          # 通义千问 API 封装（流式+非流式）
 │   ├── rag/
-│   │   └── pipeline.py             # RAG 管线（问题重写/检索/重排/生成/推荐）
+│   │   └── pipeline.py             # RAG 管线（问题重写/检索/重排/生成/推荐/Agentic 工具模式）
+│   ├── tools/                      # 🛠️ 工具调用模块（Function Calling）
+│   │   ├── registry.py             # 工具注册表 + 工具循环执行器
+│   │   └── tools.py                # 内置工具（时间/计算/列集合/检索知识库/统计/审计）
 │   ├── reranker.py                 # 检索重排器（交叉编码器 + 轻量降级）
 │   ├── auth.py                     # JWT + API Key 认证
 │   ├── users.py                    # 用户管理（PBKDF2 密码哈希）
