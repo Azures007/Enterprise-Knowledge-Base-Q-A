@@ -188,6 +188,16 @@ async def _tool_query_audit_summary(ctx: dict, **kwargs) -> dict:
         return {"error": str(e)}
 
 
+async def _tool_get_weather(ctx: dict, **kwargs) -> dict:
+    """查询城市天气（实时 + 预报）"""
+    city = str(kwargs.get("city", "")).strip()
+    if not city:
+        return {"error": "请提供要查询的城市名称"}
+    from src.tools.weather import get_weather
+
+    return await get_weather(city, kwargs.get("days") or 1)
+
+
 # ==============================================================================
 # 工具注册表
 # ==============================================================================
@@ -254,6 +264,22 @@ TOOL_DEFINITIONS: list[dict] = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询指定城市的实时天气与未来几天预报，返回温度、天气状况、风力、湿度。"
+                           "当用户询问某地的天气、气温、是否下雨/下雪、明天冷不冷等问题时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名称，如：北京、上海、广州、杭州，也支持英文如 shanghai"},
+                    "days": {"type": "integer", "description": "预报天数 1~7，默认 1（仅今天）"},
+                },
+                "required": ["city"],
+            },
+        },
+    },
 ]
 
 # 工具名 → 异步执行函数映射
@@ -264,6 +290,7 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "search_knowledge_base": _tool_search_knowledge_base,
     "get_knowledge_base_stats": _tool_get_knowledge_base_stats,
     "query_audit_summary": _tool_query_audit_summary,
+    "get_weather": _tool_get_weather,
 }
 
 

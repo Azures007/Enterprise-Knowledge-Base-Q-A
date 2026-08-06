@@ -713,7 +713,8 @@ Enterprise-Knowledge-Base-Q-A/
 │   │   └── pipeline.py             # RAG 管线（问题重写/检索/重排/生成/推荐/Agentic 工具模式）
 │   ├── tools/                      # 🛠️ 工具调用模块（Function Calling）
 │   │   ├── registry.py             # 工具注册表 + 工具循环执行器
-│   │   └── tools.py                # 内置工具（时间/计算/列集合/检索知识库/统计/审计）
+│   │   ├── tools.py                # 内置工具（时间/计算/列集合/检索知识库/统计/审计）
+│   │   └── weather.py              # 天气查询工具（Open-Meteo，中文城市名）
 │   ├── reranker.py                 # 检索重排器（交叉编码器 + 轻量降级）
 │   ├── auth.py                     # JWT + API Key 认证
 │   ├── users.py                    # 用户管理（PBKDF2 密码哈希）

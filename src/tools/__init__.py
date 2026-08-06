@@ -29,6 +29,7 @@ from src.tools.tools import (
     TOOL_DEFINITIONS,
     run_tools,
 )
+from src.tools.weather import get_weather
 
 __all__ = [
     "ToolExecutor",
@@ -36,4 +37,5 @@ __all__ = [
     "build_tool_definitions",
     "TOOL_DEFINITIONS",
     "run_tools",
+    "get_weather",
 ]
