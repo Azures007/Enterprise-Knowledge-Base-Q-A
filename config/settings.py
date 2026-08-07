@@ -214,8 +214,24 @@ class Settings(BaseSettings):
     TOOL_CALLING_MAX_ROUNDS: int = 4
     """工具循环最大轮数，防止 LLM 反复调工具死循环"""
 
+    TOOL_CALLING_MAX_CALLS: int = 8
+    """整个工具循环累计调用次数上限（含被拦截的），防止单次会话调用过多工具"""
+
+    TOOL_CALLING_TOKEN_BUDGET: int = 16000
+    """累计 token 预算上限，超过则强制收敛，防止上下文膨胀"""
+
+    TOOL_CALLING_DUP_THRESHOLD: int = 2
+    """同一工具+同一参数累计调用多少次后判定为重复调用并拒绝"""
+
     TOOL_CALLING_RESULT_LIMIT: int = 2000
     """工具结果截断字符数，防止上下文爆炸"""
+
+    TOOL_CONFIRM_EXPIRES: int = 300
+    """写操作确认请求有效期（秒），默认 5 分钟"""
+
+    TOOL_MUTATION_TOOLS: str = ""
+    """写操作工具名（逗号分隔），如 delete_document,rename_collection。
+       此类工具被调用时不会立即执行，需用户确认（POST /api/tool/confirm）"""
 
     # ================================================================
     # 日志配置

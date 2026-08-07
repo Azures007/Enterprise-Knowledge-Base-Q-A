@@ -145,6 +145,12 @@ class MessageFeedbackRequest(BaseModel):
     comment: Optional[str] = Field(None, max_length=500, description="点踩原因（可选）")
 
 
+class ToolConfirmRequest(BaseModel):
+    """写操作确认请求体"""
+
+    confirm_id: str = Field(..., min_length=1, description="确认请求 ID（工具返回的 confirm_id）")
+
+
 class UpdateConversationTitleRequest(BaseModel):
     """修改对话标题请求体"""
 

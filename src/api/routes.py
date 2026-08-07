@@ -68,6 +68,7 @@ from .models import (
     ResetPasswordRequest,
     SourceInfo,
     StreamQueryRequest,
+    ToolConfirmRequest,
     UpdateConversationTitleRequest,
     UpdateMessageRequest,
 )
@@ -2113,3 +2114,59 @@ async def get_query_audit_summary(
     except Exception as e:
         logger.error(f"查询审计汇总失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"查询审计汇总失败: {e}")
+
+
+# ---------------------------------------------------------------
+# 写操作确认（草稿-确认-执行）
+# ---------------------------------------------------------------
+
+@router.post("/tool/confirm", summary="确认并执行写操作工具")
+async def confirm_tool(
+    body: ToolConfirmRequest,
+    request: Request,
+    rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
+):
+    """
+    确认一条待执行的写操作工具请求，确认后真正执行。
+
+    流程：
+        1. 工具调用时，写操作工具被拦截，返回 confirm_id（不执行）
+        2. 用户在前端看到"是否执行 XX 操作"，点击确认
+        3. 前端带 confirm_id 调本接口
+        4. 后端校验 confirm_id 有效且属于当前用户，然后执行工具
+    """
+    executor = getattr(rag, "tool_executor", None)
+    if executor is None:
+        raise HTTPException(status_code=400, detail="工具调用未启用")
+
+    username = auth.get("username", "anonymous")
+    ok, message, pending = executor.confirm_mutation(body.confirm_id, username)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+
+    # 真正执行工具
+    tool_name = pending.get("tool", "")
+    args_raw = pending.get("args", "{}")
+    try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+    except (ValueError, TypeError):
+        args = {"value": args_raw}
+
+    from src.tools.tools import run_tools
+
+    ctx = {
+        "rag": rag,
+        "vector_store": rag.vector_store,
+        "reranker": getattr(rag, "reranker", None),
+        "auth": auth,
+    }
+    result = await run_tools(ctx, tool_name, args)
+    logger.info(f"写操作确认执行: {tool_name}({args_raw[:80]}) -> {str(result)[:120]}")
+
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {"tool": tool_name, "result": result},
+    }
+

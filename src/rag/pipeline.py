@@ -235,7 +235,12 @@ class RAGPipeline:
                     self.llm,
                     self.tool_registry,
                     max_rounds=getattr(settings, "TOOL_CALLING_MAX_ROUNDS", 4),
+                    max_tool_calls=getattr(settings, "TOOL_CALLING_MAX_CALLS", 8),
+                    max_tokens_budget=getattr(settings, "TOOL_CALLING_TOKEN_BUDGET", 16000),
+                    duplicate_threshold=getattr(settings, "TOOL_CALLING_DUP_THRESHOLD", 2),
                     result_limit=getattr(settings, "TOOL_CALLING_RESULT_LIMIT", 2000),
+                    confirm_expires=getattr(settings, "TOOL_CONFIRM_EXPIRES", 300),
+                    mutation_tools=tuple(getattr(settings, "TOOL_MUTATION_TOOLS", "").split(",")),
                 )
                 logger.info("工具调用已启用（Agentic 检索）")
             except Exception as e:

@@ -603,6 +603,16 @@ export async function sendMessageFeedback(convId, msgId, { feedback, comment }) 
 }
 
 /**
+ * 确认并执行写操作工具（草稿-确认-执行模式）
+ */
+export async function confirmTool(confirmId) {
+  return request('/tool/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ confirm_id: confirmId }),
+  })
+}
+
+/**
  * 查询审计列表（管理员），params: { limit, offset, username }
  */
 export async function getAuditQueries(params) {

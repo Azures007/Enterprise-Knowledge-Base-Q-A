@@ -201,6 +201,10 @@ async def _tool_get_weather(ctx: dict, **kwargs) -> dict:
 # ==============================================================================
 # 工具注册表
 # ==============================================================================
+# x_meta 扩展字段（OpenAI 兼容格式允许额外字段，供执行器读取）：
+#   - mutation:  是否写操作（true 时需用户确认后才执行）
+#   - depends_on: 依赖的前置工具名列表（无依赖则为空；有依赖的工具将串行执行）
+#   - summary:    工具返回的关键字段（供多工具并行时裁剪结果）
 
 TOOL_DEFINITIONS: list[dict] = [
     {
@@ -210,6 +214,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "description": "获取当前的日期与时间。当用户询问现在几点、今天几号等时间问题时使用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
     {
         "type": "function",
@@ -222,6 +227,7 @@ TOOL_DEFINITIONS: list[dict] = [
                 "required": ["expression"],
             },
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
     {
         "type": "function",
@@ -230,6 +236,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "description": "列出企业知识库中所有集合及其文档块数量。当用户询问知识库有哪些内容、想了解知识库结构时使用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
     {
         "type": "function",
@@ -247,6 +254,7 @@ TOOL_DEFINITIONS: list[dict] = [
                 "required": ["question"],
             },
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
     {
         "type": "function",
@@ -255,6 +263,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "description": "获取知识库统计信息（文档块总数、集合列表、查询次数等）。当用户询问知识库规模、数据量时使用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
     {
         "type": "function",
@@ -263,6 +272,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "description": "获取查询审计汇总统计（总查询数、缓存命中率、平均延迟、Token 用量、热门问题）。管理员可用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
     {
         "type": "function",
@@ -279,8 +289,17 @@ TOOL_DEFINITIONS: list[dict] = [
                 "required": ["city"],
             },
         },
+        "x_meta": {"mutation": False, "depends_on": []},
     },
 ]
+
+# 从定义中提取 x_meta 的便捷函数（供执行器/测试使用）
+def tool_meta(name: str) -> dict:
+    """按工具名返回 x_meta 元数据（默认：非写操作、无依赖）。"""
+    for d in TOOL_DEFINITIONS:
+        if d.get("function", {}).get("name") == name:
+            return d.get("x_meta", {"mutation": False, "depends_on": []})
+    return {"mutation": False, "depends_on": []}
 
 # 工具名 → 异步执行函数映射
 TOOL_HANDLERS: dict[str, Callable] = {
