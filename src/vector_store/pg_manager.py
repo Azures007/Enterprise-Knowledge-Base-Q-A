@@ -43,6 +43,7 @@ from typing import Any, Optional
 import asyncpg
 
 from config.settings import settings
+from src.monitoring import get_metrics
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -1261,15 +1262,50 @@ class PGVectorStore:
         keyword_weight: float = 0.3,
     ) -> list[dict[str, Any]]:
         """
-        混合检索：向量相似度 + 关键词加权融合。
+        混合检索：向量语义召回 + 关键词全文召回 双通道融合。
+
+        与纯向量检索（asimilarity_search）的区别：
+        - 向量通道：HNSW 索引的余弦相似度召回，捕捉语义相近但用词不同的块
+        - 关键词通道：PostgreSQL 全文检索（search_vector tsvector + GIN 索引），
+          精确匹配专有名词/编号/代码片段（向量分往往不高，纯向量易漏检）
+        - 融合策略由 HYBRID_FUSION_MODE 决定：
+            - "rrf"（默认）：Reciprocal Rank Fusion，对两通道的排序取倒数加权，
+              不依赖分数绝对值可比性，避免向量分/关键词分量纲差异互相压轧
+            - "weighted"：保留经典的 向量 0.7 + 关键词 0.3 线性加权（兼容旧行为）
+
+        解决纯向量检索对专有名词/编号/代码片段召回差的问题。
+        """
+        k = k or settings.RETRIEVAL_TOP_K
+        # 按配置选择融合策略：rrf 走双通道融合，weighted 走线性加权（旧逻辑）
+        fusion_mode = getattr(settings, "HYBRID_FUSION_MODE", "rrf")
+        if fusion_mode == "rrf":
+            return await self._ahybrid_search_rrf(
+                query, k=k, filter=filter,
+                vector_weight=vector_weight, keyword_weight=keyword_weight,
+            )
+        return await self._ahybrid_search_weighted(
+            query, k=k, filter=filter,
+            vector_weight=vector_weight, keyword_weight=keyword_weight,
+        )
+
+    # ------------------------------------------------------------------
+    # 融合模式 2：线性加权（兼容旧行为）
+    # ------------------------------------------------------------------
+
+    async def _ahybrid_search_weighted(
+        self,
+        query: str,
+        k: int | None = None,
+        filter: dict[str, Any] | None = None,
+        vector_weight: float = 0.7,
+        keyword_weight: float = 0.3,
+    ) -> list[dict[str, Any]]:
+        """线性加权混合检索：向量分 + n-gram 关键词命中率加权。
 
         - 向量分：余弦相似度（0~1）
         - 关键词分：n-gram 关键词命中率（0~1）。中文按 2~4 字切分，
           英文按整词，统计命中率。不依赖 PostgreSQL 分词器（对中文有效）。
         - 综合分 = vector_weight * 向量分 + keyword_weight * 关键词分
-
-        解决纯向量检索对专有名词/编号/代码片段召回差的问题：
-        关键词命中的块即使向量分不高，也会因关键词分被提升。
         """
         k = k or settings.RETRIEVAL_TOP_K
 
@@ -1346,6 +1382,192 @@ class PGVectorStore:
         logger.debug(
             f"混合检索完成: query='{query[:50]}...', "
             f"k={k}, 结果数={len(results)}"
+        )
+        return results
+
+    # ------------------------------------------------------------------
+    # 融合模式 1：RRF 双通道召回（向量 + 全文，默认）
+    # ------------------------------------------------------------------
+
+    async def _ahybrid_search_rrf(
+        self,
+        query: str,
+        k: int | None = None,
+        filter: dict[str, Any] | None = None,
+        vector_weight: float = 0.7,
+        keyword_weight: float = 0.3,
+    ) -> list[dict[str, Any]]:
+        """
+        RRF 双通道混合检索：向量语义召回 + PostgreSQL 全文召回分别取 top-candidate，
+        再用 Reciprocal Rank Fusion 融合排序。
+
+        设计要点：
+        1. 关键词通道走 chunks.search_vector（tsvector 生成列 + GIN 索引），
+           用 plainto_tsquery('simple', ...) 做词元匹配。相比旧实现的
+           LIKE '%kw%' 全表扫描，能用上索引，且不依赖外部中文分词器。
+        2. RRF 分数 = Σ w_channel / (60 + rank_channel)，对通道内的排名倒数加权，
+           不要求两个通道的分数在同一量纲 —— 避免向量分与关键词分量级差异
+           互相压轧（旧的线性加权在候选数大时，向量分几乎主导）。
+        3. 两个通道都限定在候选池内取 top candidate_k（默认 20），再取并集，
+           最终 LIMIT k。向量通道用 HNSW 索引，全文通道用 GIN 索引，均非全表扫描。
+        """
+        k = k or settings.RETRIEVAL_TOP_K
+        candidate_k = getattr(settings, "HYBRID_CANDIDATE_K", 20)
+        fusion_const = getattr(settings, "HYBRID_RRF_K", 60)
+
+        # ---- 通道 1：向量语义召回（HNSW） ----
+        vec_results = await self.asimilarity_search(query, k=candidate_k, filter=filter)
+
+        # ---- 通道 2：关键词全文召回（tsvector + GIN） ----
+        kw_results: list[dict[str, Any]] = []
+        kw_terms = self._extract_query_keywords(query)
+        # plainto_tsquery('simple', '词1 词2'): 词元全部命中才匹配。
+        # 中文按空格间隔传入，等价于 AND 语义；无有效词元时跳过关键词通道。
+        if kw_terms:
+            kw_results = await self._akeyword_search(
+                query, k=candidate_k, filter=filter, terms=kw_terms,
+            )
+
+        # ---- RRF 融合 ----
+        rank_scores: dict[str, float] = {}
+        channel_flags: dict[str, dict] = {}
+
+        # 向量通道贡献
+        for rank, doc in enumerate(vec_results):
+            key = doc["content"]
+            rank_scores[key] = rank_scores.get(key, 0.0) + vector_weight / (fusion_const + rank)
+            channel_flags.setdefault(key, {})["vector"] = doc
+        # 全文通道贡献
+        for rank, doc in enumerate(kw_results):
+            key = doc["content"]
+            rank_scores[key] = rank_scores.get(key, 0.0) + keyword_weight / (fusion_const + rank)
+            entry = channel_flags.setdefault(key, {})
+            entry["keyword"] = doc
+
+        # 合并通道信息，按 RRF 分数降序取前 k
+        merged: list[dict[str, Any]] = []
+        for key, score in rank_scores.items():
+            channels = channel_flags.get(key, {})
+            vec_doc = channels.get("vector")
+            kw_doc = channels.get("keyword")
+            # 综合分取两通道分数的加权平均（与 RRF 排名并行展示，供重排参考）
+            vec_score = float(vec_doc.get("score", 0.0)) if vec_doc else 0.0
+            kw_score = float(kw_doc.get("score", 0.0)) if kw_doc else 0.0
+            if vec_doc and kw_doc:
+                combined = vector_weight * vec_score + keyword_weight * kw_score
+            else:
+                combined = vec_score if vec_doc else kw_score
+
+            item = {
+                "content": key,
+                "metadata": (vec_doc or kw_doc).get("metadata", {}),
+                "score": round(combined, 4),
+                "rrf_score": round(score, 6),
+                "vector_score": round(vec_score, 4) if vec_doc else None,
+                "keyword_score": round(kw_score, 4) if kw_doc else None,
+                "distance": round(1.0 - vec_score, 4) if vec_doc else None,
+            }
+            merged.append(item)
+
+        merged.sort(key=lambda d: d["rrf_score"], reverse=True)
+
+        # 保留 rrf 分数最高的前 k；分数并列时优先双通道都命中的块
+        merged.sort(
+            key=lambda d: (
+                d["rrf_score"],
+                1 if d["vector_score"] is not None and d["keyword_score"] is not None else 0,
+            ),
+            reverse=True,
+        )
+        merged = merged[:k]
+
+        logger.debug(
+            f"RRF 混合检索完成: query='{query[:50]}...', "
+            f"向量通道={len(vec_results)}, 全文通道={len(kw_results)}, "
+            f"融合后={len(merged)} (模式={fusion_const})"
+        )
+        get_metrics().set_gauge(
+            "hybrid_fusion_mode", getattr(settings, "HYBRID_FUSION_MODE", "rrf")
+        )
+        # 关键词通道召回数 → 观测指标（纯向量查询可能不触发关键词通道）
+        if kw_results:
+            from src.monitoring import record_hybrid_keyword_channel
+            record_hybrid_keyword_channel(len(kw_results))
+        return merged
+
+    async def _akeyword_search(
+        self,
+        query: str,
+        k: int | None = None,
+        filter: dict[str, Any] | None = None,
+        terms: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        关键词全文检索：利用 chunks.search_vector（tsvector 生成列 + GIN 索引）。
+
+        用 plainto_tsquery('simple', terms_joined) 构造查询，匹配 content 的
+        word token（'simple' 分词器按空白/标点切词，中文整句视为一个 token，
+        因此仅对查询中已有的英文/数字词元有效）。score 用 ts_rank 归一化。
+
+        查询串以空格连接词元，避免 plainto_tsquery 将多个中文 n-gram 当 OR
+        处理导致召回膨胀。
+        """
+        k = k or settings.RETRIEVAL_TOP_K
+        coll_id = await self._aensure_collection(self.collection_name)
+        if coll_id is None:
+            return []
+        if not terms:
+            return []
+
+        # 词元统一小写（'simple' 分词器对英文大小写不敏感）
+        cleaned = [t.lower() for t in terms if t and t.strip()]
+        if not cleaned:
+            return []
+        ts_query = " ".join(cleaned)
+
+        filter_sql = ""
+        params: list = [coll_id, k, ts_query]
+        if filter:
+            conds = []
+            for key, val in filter.items():
+                params.append(key)
+                params.append(str(val))
+                n = len(params)
+                conds.append(f"c.metadata->>${n - 1} = ${n}")
+            filter_sql = " AND " + " AND ".join(conds)
+
+        async with (await self._aconn()).acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    c.content AS content,
+                    c.metadata AS metadata,
+                    ts_rank(c.search_vector, plainto_tsquery('simple', $3)) AS rank_score
+                FROM chunks c
+                LEFT JOIN documents d ON c.document_id = d.id
+                WHERE c.collection_id = $1{filter_sql}
+                  AND (c.document_id IS NULL OR d.is_latest = true)
+                  AND c.search_vector @@ plainto_tsquery('simple', $3)
+                ORDER BY rank_score DESC
+                LIMIT $2
+                """,
+                *params,
+            )
+
+        results = []
+        for row in rows:
+            rank_score = float(row["rank_score"])
+            # ts_rank 归一化到 0~1（对 'simple' 分词器，score 通常很小）
+            norm_score = min(1.0, rank_score)
+            results.append({
+                "content": row["content"],
+                "metadata": _json_or_dict(row["metadata"]),
+                "score": round(norm_score, 4),
+            })
+
+        logger.debug(
+            f"关键词全文检索完成: query='{query[:50]}...', "
+            f"terms={len(cleaned)}, 结果数={len(results)}"
         )
         return results
 

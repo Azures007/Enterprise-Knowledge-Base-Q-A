@@ -86,6 +86,16 @@ class Settings(BaseSettings):
     HYBRID_SEARCH_ENABLED: bool = True
     """是否启用混合检索（向量 0.7 + 关键词 0.3 融合）。提升专有名词/编号类查询召回"""
 
+    HYBRID_FUSION_MODE: str = "rrf"
+    """混合检索融合策略: rrf（Reciprocal Rank Fusion，双通道召回+排名倒数加权，默认）
+       | weighted（向量分 0.7 + 关键词分 0.3 线性加权，兼容旧行为）"""
+
+    HYBRID_CANDIDATE_K: int = 20
+    """混合检索每通道的候选召回数（重排前的粗召回，融合后取前 RETRIEVAL_TOP_K）"""
+
+    HYBRID_RRF_K: int = 60
+    """RRF 融合常量（score = Σ w / (k + rank)，该值越小，排名靠前的块权重越大）"""
+
     QUERY_REWRITE_ENABLED: bool = True
     """是否启用多轮问题重写（结合历史把当前问题改写成独立完整问题）"""
 

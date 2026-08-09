@@ -146,3 +146,8 @@ def record_llm_failed(msg: str | None = None):
 def record_embedding_failed(msg: str | None = None):
     """记录一次嵌入调用失败。"""
     _metrics.increment("embedding_call_failed", msg=msg)
+
+
+def record_hybrid_keyword_channel(kw_hits: int):
+    """记录一次混合检索关键词通道召回数量（用于观测关键词通道活跃度）。"""
+    _metrics.increment("hybrid_keyword_channel_hits", by=max(0, int(kw_hits)))
