@@ -24,6 +24,7 @@ import re
 from typing import Any
 
 from config.settings import settings
+from src.monitoring import get_metrics, record_rerank_degraded
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -49,6 +50,8 @@ class Reranker:
             # 若交叉编码器不可用，标记为轻量模式（rerank 时实际生效）
             if self._mode == "off":
                 self._mode = "lightweight"
+        # 暴露当前模式到指标（供 /api/metrics 查看）
+        get_metrics().set_gauge("rerank_mode", self._mode)
 
     def _try_load_cross_encoder(self):
         """尝试加载本地交叉编码器模型（bge-reranker-base）。
@@ -85,6 +88,7 @@ class Reranker:
             # 超时：模型仍在后台下载，本次放弃，降级轻量重排
             self._model = None
             self._model_available = False
+            record_rerank_degraded(f"交叉编码器加载超时（>{timeout}s）")
             logger.warning(
                 f"交叉编码器加载超时（>{timeout}s，可能需从 Hugging Face 下载模型），"
                 f"已降级为轻量重排。可设置 RERANKER_TIMEOUT 增大等待时间"
@@ -92,6 +96,7 @@ class Reranker:
         else:
             self._model = None
             self._model_available = False
+            record_rerank_degraded(f"交叉编码器加载失败: {result.get('error')}")
             logger.warning(
                 f"交叉编码器加载失败，降级为轻量重排: {result.get('error')}\n"
                 f"如需使用语义重排，请安装: pip install sentence-transformers"
@@ -161,6 +166,7 @@ class Reranker:
             )
             return result
         except Exception as e:
+            record_rerank_degraded(f"交叉编码器重排运行时失败: {e}")
             logger.warning(f"交叉编码器重排失败，降级为轻量重排: {e}")
             return self._rerank_lightweight(query, candidates, top_k)
 

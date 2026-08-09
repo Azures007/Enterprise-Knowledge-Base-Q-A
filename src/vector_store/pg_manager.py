@@ -240,6 +240,19 @@ class PGVectorStore:
                     created_at      TIMESTAMP DEFAULT NOW()
                 )
             """)
+            # 版本化迁移：为 documents 表补充版本列
+            #   version      当前版本号（同名文档的每次更新 +1，从 1 开始）
+            #   is_latest    是否当前生效版本（旧版本保留记录但不参与检索）
+            #   prev_doc_id  指向上一个版本的文档 ID（构成版本链）
+            for col_sql in (
+                'ALTER TABLE documents ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1',
+                'ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_latest BOOLEAN DEFAULT true',
+                'ALTER TABLE documents ADD COLUMN IF NOT EXISTS prev_doc_id INTEGER',
+            ):
+                try:
+                    await conn.execute(col_sql)
+                except Exception as e:
+                    logger.warning(f"documents 版本列迁移失败: {e}")
 
             # 文本块 + 向量表
             await conn.execute(f"""
@@ -772,6 +785,31 @@ class PGVectorStore:
         logger.info(f"文档记录已创建: {filename} (id={doc_id})")
         return doc_id
 
+    async def _amark_document_superseded(self, doc_id: int) -> None:
+        """将文档标记为已失效（被新版本覆盖），其 chunks 不再参与检索。"""
+        async with (await self._aconn()).acquire() as conn:
+            await conn.execute(
+                "UPDATE documents SET is_latest = false WHERE id = $1",
+                doc_id,
+            )
+
+    async def _aget_document_version(self, doc_id: int) -> int:
+        """获取文档当前版本号。"""
+        async with (await self._aconn()).acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT version FROM documents WHERE id = $1",
+                doc_id,
+            )
+        return (row["version"] if row and row["version"] else 1) or 1
+
+    async def _amark_document_version(self, doc_id: int, version: int, prev_doc_id: int | None) -> None:
+        """设置文档的版本号与前置版本链。"""
+        async with (await self._aconn()).acquire() as conn:
+            await conn.execute(
+                "UPDATE documents SET version = $1, prev_doc_id = $2 WHERE id = $3",
+                version, prev_doc_id, doc_id,
+            )
+
     async def _alog_audit(
         self,
         action: str,
@@ -815,7 +853,7 @@ class PGVectorStore:
                 """
                 SELECT id, filename, file_size, created_at
                 FROM documents
-                WHERE collection_id = $1 AND content_hash = $2
+                WHERE collection_id = $1 AND content_hash = $2 AND is_latest = true
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -840,7 +878,7 @@ class PGVectorStore:
                 """
                 SELECT id, filename, file_size, created_at
                 FROM documents
-                WHERE collection_id = $1 AND filename = $2
+                WHERE collection_id = $1 AND filename = $2 AND is_latest = true
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -901,7 +939,7 @@ class PGVectorStore:
             )
 
     async def alist_documents(self) -> list[dict]:
-        """获取当前集合中的所有文档列表（含 chunk 数量）。"""
+        """获取当前集合中的所有文档列表（含 chunk 数量，仅最新版本）。"""
         coll_id = await self._aget_collection_id(self.collection_name)
         if coll_id is None:
             return []
@@ -910,13 +948,14 @@ class PGVectorStore:
                 """
                 SELECT d.id, d.filename, d.file_type, d.file_size,
                        d.storage_backend, d.storage_path, d.created_at,
+                       d.version, d.is_latest, d.prev_doc_id,
                        (
                          SELECT COUNT(*) FROM chunks c
                          WHERE c.document_id = d.id
                             OR (c.document_id IS NULL AND c.metadata->>'filename' = d.filename)
                        ) AS chunk_count
                 FROM documents d
-                WHERE d.collection_id = $1
+                WHERE d.collection_id = $1 AND d.is_latest = true
                 ORDER BY d.created_at DESC
                 """,
                 coll_id,
@@ -931,12 +970,124 @@ class PGVectorStore:
                 "storage_path": r["storage_path"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 "chunk_count": r["chunk_count"],
+                "version": r["version"],
+                "is_latest": r["is_latest"],
+                "prev_doc_id": r["prev_doc_id"],
             }
             for r in rows
         ]
 
+    # ================================================================
+    # 文档版本化（重传同名文件时保留历史版本，支持回滚）
+    # ================================================================
+
+    async def areplace_document_for_new_version(self, old_doc_id: int) -> None:
+        """重传覆盖时，将旧文档标记为已失效（is_latest=false），保留其记录与 chunks 供回滚。"""
+        await self._amark_document_superseded(old_doc_id)
+        logger.info(f"文档 {old_doc_id} 已被新版本覆盖（is_latest=false，保留历史版本）")
+
+    async def alist_document_versions(self, doc_id: int) -> list[dict[str, Any]]:
+        """
+        获取文档的完整版本链（含当前版本，按版本号降序）。
+
+        Returns:
+            [{"id", "version", "is_latest", "filename", "file_size",
+              "content_hash", "created_at", "chunk_count"}, ...]
+        """
+        async with (await self._aconn()).acquire() as conn:
+            # 先定位文档所在集合与文件族：从当前文档沿 prev_doc_id 回溯，
+            # 或从该文档向上找最新的版本族根
+            row = await conn.fetchrow(
+                "SELECT collection_id, filename FROM documents WHERE id = $1",
+                doc_id,
+            )
+            if row is None:
+                return []
+            coll_id, filename = row["collection_id"], row["filename"]
+            # 同一文件名（同一集合）的所有版本
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.version, d.is_latest, d.filename, d.file_size,
+                       d.content_hash, d.created_at, d.prev_doc_id,
+                       (
+                         SELECT COUNT(*) FROM chunks c
+                         WHERE c.document_id = d.id
+                            OR (c.document_id IS NULL AND c.metadata->>'filename' = d.filename AND d.version = 1)
+                       ) AS chunk_count
+                FROM documents d
+                WHERE d.collection_id = $1 AND d.filename = $2
+                ORDER BY d.version DESC NULLS LAST, d.id DESC
+                """,
+                coll_id, filename,
+            )
+        return [
+            {
+                "id": r["id"],
+                "version": r["version"],
+                "is_latest": r["is_latest"],
+                "filename": r["filename"],
+                "file_size": r["file_size"],
+                "content_hash": r["content_hash"],
+                "prev_doc_id": r["prev_doc_id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "chunk_count": r["chunk_count"],
+            }
+            for r in rows
+        ]
+
+    async def arollback_document(self, doc_id: int) -> dict[str, Any] | None:
+        """
+        回滚到指定版本的文档。
+
+        将该版本标记为最新（is_latest=true），当前最新版本标记为失效。
+        若指定版本已是当前版本，直接返回其信息不动作。
+
+        Returns:
+            回滚后的文档信息 dict（含 filename, version），或 None（文档不存在）
+        """
+        async with (await self._aconn()).acquire() as conn:
+            target = await conn.fetchrow(
+                "SELECT id, collection_id, filename, version, is_latest FROM documents WHERE id = $1",
+                doc_id,
+            )
+            if target is None:
+                return None
+            # 若目标已是当前版本，无需回滚
+            if target["is_latest"]:
+                return {
+                    "id": target["id"],
+                    "filename": target["filename"],
+                    "version": target["version"],
+                    "already_latest": True,
+                }
+
+            # 标记当前最新版本失效
+            await conn.execute(
+                """
+                UPDATE documents SET is_latest = false
+                WHERE collection_id = $1 AND filename = $2 AND is_latest = true
+                """,
+                target["collection_id"], target["filename"],
+            )
+            # 目标版本设为最新
+            await conn.execute(
+                "UPDATE documents SET is_latest = true WHERE id = $1",
+                doc_id,
+            )
+
+        return {
+            "id": target["id"],
+            "filename": target["filename"],
+            "version": target["version"],
+            "already_latest": False,
+        }
+
     async def adelete_document(self, doc_id: int, delete_storage: bool = True) -> dict | None:
-        """删除文档及其所有分块，可选择同时删除存储文件。"""
+        """
+        删除文档及其所有分块（含历史版本），可选择同时删除存储文件。
+
+        版本化场景下，同名文档的所有历史版本一并删除，避免孤儿记录。
+        """
         async with (await self._aconn()).acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT filename, file_type, file_size, storage_backend, storage_path, content_hash FROM documents WHERE id = $1",
@@ -955,29 +1106,58 @@ class PGVectorStore:
                 "content_hash": row["content_hash"],
             }
 
-            # 删除通过 document_id 关联的 chunks
-            deleted_by_id = _parse_rowcount(
-                await conn.execute("DELETE FROM chunks WHERE document_id = $1", doc_id)
+            # 找到该文档所在的整个版本链（同集合 + 同文件名的所有版本）
+            family_rows = await conn.fetch(
+                """
+                SELECT id, storage_path, storage_backend
+                FROM documents
+                WHERE collection_id = (SELECT collection_id FROM documents WHERE id = $1)
+                  AND filename = (SELECT filename FROM documents WHERE id = $1)
+                """,
+                doc_id,
             )
-            # 兼容历史数据（未关联 document_id 但文件名匹配）
+            family_ids = [r["id"] for r in family_rows]
+            # 记录所有版本的存储文件路径（供删除存储后端）
+            storage_paths = [
+                (r["storage_path"], r["storage_backend"])
+                for r in family_rows if r["storage_path"]
+            ]
+
+            # 删除版本链所有文档关联的 chunks（document_id 关联）
+            deleted_chunks = 0
+            for fid in family_ids:
+                deleted_chunks += _parse_rowcount(
+                    await conn.execute("DELETE FROM chunks WHERE document_id = $1", fid)
+                )
+            # 兼容历史数据（未关联 document_id 但文件名匹配，仅删除最新家族对应记录）
             deleted_by_name = _parse_rowcount(
                 await conn.execute(
                     "DELETE FROM chunks WHERE document_id IS NULL AND metadata->>'filename' = $1",
                     doc_info["filename"],
                 )
             )
-            deleted_chunks = deleted_by_id + deleted_by_name
-            await conn.execute("DELETE FROM documents WHERE id = $1", doc_id)
+            deleted_chunks += deleted_by_name
+            # 删除版本链所有文档记录
+            if family_ids:
+                await conn.execute(
+                    "DELETE FROM documents WHERE id = ANY($1::int[])",
+                    family_ids,
+                )
 
-        # 删除存储后端中的原始文件
-        if delete_storage and doc_info["storage_path"]:
+        # 删除存储后端中的原始文件（所有版本）
+        if delete_storage and storage_paths:
+            from src.storage import get_storage
             try:
-                from src.storage import get_storage
                 storage = get_storage()
-                storage.delete(doc_info["storage_path"])
-                logger.info(f"存储文件已删除: {doc_info['storage_path']}")
-            except Exception as e:
-                logger.warning(f"删除存储文件失败（不影响数据库删除）: {e}")
+            except Exception:
+                storage = None
+            for spath, _sbackend in storage_paths:
+                if storage is not None:
+                    try:
+                        storage.delete(spath)
+                        logger.info(f"存储文件已删除: {spath}")
+                    except Exception as e:
+                        logger.warning(f"删除存储文件失败（不影响数据库删除）: {e}")
 
         await self._alog_audit(
             action="delete",
@@ -1035,19 +1215,21 @@ class PGVectorStore:
                 params.append(key)
                 params.append(str(val))
                 n = len(params)
-                conds.append(f"metadata->>${n - 1} = ${n}")
+                conds.append(f"c.metadata->>${n - 1} = ${n}")
             filter_sql = " AND " + " AND ".join(conds)
 
         async with (await self._aconn()).acquire() as conn:
             rows = await conn.fetch(
                 f"""
                 SELECT
-                    content,
-                    metadata,
-                    1 - (embedding <=> $1::vector) AS cosine_similarity
-                FROM chunks
-                WHERE collection_id = $2{filter_sql}
-                ORDER BY embedding <=> $1::vector
+                    c.content AS content,
+                    c.metadata AS metadata,
+                    1 - (c.embedding <=> $1::vector) AS cosine_similarity
+                FROM chunks c
+                LEFT JOIN documents d ON c.document_id = d.id
+                WHERE c.collection_id = $2{filter_sql}
+                  AND (c.document_id IS NULL OR d.is_latest = true)
+                ORDER BY c.embedding <=> $1::vector
                 LIMIT $3
                 """,
                 *params,
@@ -1116,28 +1298,30 @@ class PGVectorStore:
                 params.append(key)
                 params.append(str(val))
                 n = len(params)
-                conds.append(f"metadata->>${n - 1} = ${n}")
+                conds.append(f"c.metadata->>${n - 1} = ${n}")
             filter_sql = " AND " + " AND ".join(conds)
 
         # 关键词命中计数：每命中一个关键词 content LIKE %kw% 计 1 分（boolean→int）
         kw_conditions = []
         for i, kw in enumerate(keywords):
             params.append(f"%{kw}%")
-            kw_conditions.append(f"(CASE WHEN content LIKE ${len(params)} THEN 1 ELSE 0 END)")
+            kw_conditions.append(f"(CASE WHEN c.content LIKE ${len(params)} THEN 1 ELSE 0 END)")
         kw_score_sql = " + ".join(kw_conditions) if kw_conditions else "0"
 
         async with (await self._aconn()).acquire() as conn:
             rows = await conn.fetch(
                 f"""
                 SELECT
-                    content,
-                    metadata,
-                    1 - (embedding <=> $1::vector) AS cosine_similarity,
+                    c.content AS content,
+                    c.metadata AS metadata,
+                    1 - (c.embedding <=> $1::vector) AS cosine_similarity,
                     -- 关键词命中数（0 ~ len(keywords)），归一化到 0~1
                     LEAST(1.0, ({kw_score_sql})::float / {max(len(keywords), 1)}) AS keyword_score
-                FROM chunks
-                WHERE collection_id = $2{filter_sql}
-                ORDER BY ({vector_weight} * (1 - (embedding <=> $1::vector))
+                FROM chunks c
+                LEFT JOIN documents d ON c.document_id = d.id
+                WHERE c.collection_id = $2{filter_sql}
+                  AND (c.document_id IS NULL OR d.is_latest = true)
+                ORDER BY ({vector_weight} * (1 - (c.embedding <=> $1::vector))
                          + {keyword_weight} * LEAST(1.0, ({kw_score_sql})::float / {max(len(keywords), 1)})) DESC
                 LIMIT $3
                 """,

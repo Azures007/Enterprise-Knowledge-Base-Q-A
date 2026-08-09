@@ -234,6 +234,22 @@ class Settings(BaseSettings):
        此类工具被调用时不会立即执行，需用户确认（POST /api/tool/confirm）"""
 
     # ================================================================
+    # MCP (Model Context Protocol) 配置
+    # ================================================================
+    MCP_SERVERS_JSON: str = ""
+    """MCP Server 配置（JSON 数组或 mcpServers 对象）。
+
+    stdio 方式（本地进程，如社区现成的天气 server）:
+        [{"name":"weather","type":"stdio","command":"npx",
+          "args":["-y","yiketianqi-weather-mcp"]}]
+
+    HTTP/SSE 方式（远程 server）:
+        [{"name":"weather","type":"http","url":"http://localhost:9000/mcp"}]
+    """
+    MCP_TIMEOUT: int = 30
+    """MCP 工具调用超时（秒）"""
+
+    # ================================================================
     # 日志配置
     # ================================================================
     LOG_LEVEL: str = "INFO"

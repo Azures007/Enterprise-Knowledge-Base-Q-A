@@ -60,6 +60,12 @@ async def lifespan(app: FastAPI):
     rag_pipeline = RAGPipeline()
     app.state.rag_pipeline = rag_pipeline
 
+    # 连接 MCP Server 并合并工具（仅当配置了 MCP_SERVERS_JSON）
+    try:
+        await rag_pipeline.aconnect_mcp()
+    except Exception as e:
+        logger.warning(f"MCP 初始化异常（不影响启动）: {e}")
+
     # 文档加载器与分块器
     app.state.document_loader = DocumentLoader()
     app.state.text_chunker = TextChunker()
@@ -93,6 +99,13 @@ async def lifespan(app: FastAPI):
 
     # ---- 关闭阶段 ----
     logger.info("企业知识库问答系统正在关闭...")
+    try:
+        # 关闭 MCP 连接
+        store = getattr(rag_pipeline, "mcp_manager", None)
+        if store is not None:
+            await rag_pipeline.aclose_mcp()
+    except Exception as e:
+        logger.warning(f"关闭 MCP 连接时出错: {e}")
     try:
         # 关闭 asyncpg 连接池
         store = getattr(rag_pipeline, "vector_store", None)
@@ -171,6 +184,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ==============================================================================
 
 app.include_router(router)
+
+
+@app.get("/api/metrics", summary="降级/失败可观测性指标")
+async def get_metrics_endpoint():
+    """暴露系统降级与失败指标（免认证，供运维监控）。"""
+    from src.monitoring import get_metrics
+    return JSONResponse({"code": 0, "message": "success", "data": get_metrics().snapshot()})
 
 # 注册前端静态文件（生产模式）
 FRONTEND_DIST = settings.PROJECT_ROOT / "frontend" / "dist"

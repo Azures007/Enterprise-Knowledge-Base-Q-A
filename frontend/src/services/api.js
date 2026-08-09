@@ -155,6 +155,12 @@ export function streamQuery({ question, k = 5, concise = false, collection = nul
   })
     .then(async (response) => {
       if (!response.ok) {
+        if (response.status === 401) {
+          const err = await response.json().catch(() => ({}))
+          handleUnauthorized()
+          onError?.(err.detail || '登录已过期，请重新登录')
+          return
+        }
         if (response.status === 429) {
           const err = await response.json().catch(() => ({}))
           onError?.(err.message || '请求过于频繁，请稍后再试')

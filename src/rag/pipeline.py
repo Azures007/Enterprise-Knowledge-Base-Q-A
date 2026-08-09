@@ -225,12 +225,24 @@ class RAGPipeline:
 
         # 工具调用执行器（Agentic 检索，开关启用）
         self.tool_executor = None
+        self.mcp_manager = None
         if getattr(settings, "TOOL_CALLING_ENABLED", False):
             try:
                 from src.tools import ToolExecutor, ToolRegistry
                 from src.tools.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
-                self.tool_registry = ToolRegistry(TOOL_DEFINITIONS, TOOL_HANDLERS)
+                definitions, handlers = TOOL_DEFINITIONS, TOOL_HANDLERS
+
+                # MCP 工具：连接现成 MCP Server，把其工具合并进注册表。
+                # 构造时不阻塞建连（避免 FastAPI 事件循环中死锁），
+                # 通过 aconnect_mcp() 由 lifespan/CLI 主动调用完成连接。
+                mcp_json = getattr(settings, "MCP_SERVERS_JSON", "") or ""
+                if mcp_json.strip():
+                    from src.tools.mcp_client import MCPManager
+
+                    self.mcp_manager = MCPManager(mcp_json)
+
+                self.tool_registry = ToolRegistry(definitions, handlers)
                 self.tool_executor = ToolExecutor(
                     self.llm,
                     self.tool_registry,
@@ -254,6 +266,40 @@ class RAGPipeline:
             f"RAG 混合管线初始化完成（向量后端: {store_type}, "
             f"重排模式: {self.reranker.mode}）"
         )
+
+    async def aconnect_mcp(self) -> None:
+        """连接 MCP Server 并把其工具合并进工具注册表（由 lifespan/CLI 调用）。
+
+        - FastAPI: app lifespan 启动阶段调用
+        - CLI: ingest.py/query.py 用 asyncio.run 调用
+        """
+        if self.mcp_manager is None:
+            return
+        try:
+            from src.tools import ToolRegistry
+
+            await self.mcp_manager.connect_all()
+            if self.mcp_manager.is_enabled:
+                definitions, handlers = self.mcp_manager.merge_into(
+                    self.tool_registry.definitions,
+                    dict(self.tool_registry._handlers),
+                )
+                self.tool_registry = ToolRegistry(definitions, handlers)
+                if self.tool_executor is not None:
+                    self.tool_executor.registry = self.tool_registry
+                logger.info(
+                    f"MCP 工具已合并: {list(self.mcp_manager._handler_map.keys())}"
+                )
+        except Exception as e:
+            logger.warning(f"MCP 连接失败: {e}")
+
+    async def aclose_mcp(self) -> None:
+        """关闭所有 MCP 连接（app lifespan 关闭阶段调用）。"""
+        if self.mcp_manager is not None:
+            try:
+                await self.mcp_manager.aclose_all()
+            except Exception as e:
+                logger.warning(f"MCP 关闭失败: {e}")
 
     @staticmethod
     def _create_default_vector_store():

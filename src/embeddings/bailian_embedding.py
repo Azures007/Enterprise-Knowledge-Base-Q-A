@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 
 from config.settings import settings
+from src.monitoring import record_embedding_failed
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -258,6 +259,7 @@ class BailianEmbeddings:
             if attempt < self.max_retries:
                 time.sleep(self.retry_delay * attempt)
 
+        record_embedding_failed(f"已达最大重试次数: {last_error}")
         raise BailianEmbeddingsError(
             f"嵌入 API 调用失败（已达最大重试次数 {self.max_retries}）: {last_error}"
         )
@@ -338,6 +340,7 @@ class BailianEmbeddings:
             if attempt < self.max_retries:
                 await self._asleep(self.retry_delay * attempt)
 
+        record_embedding_failed(f"异步已达最大重试次数: {last_error}")
         raise BailianEmbeddingsError(
             f"嵌入 API 异步调用失败（已达最大重试次数 {self.max_retries}）: {last_error}"
         )

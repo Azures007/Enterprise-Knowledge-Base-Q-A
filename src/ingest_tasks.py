@@ -188,11 +188,15 @@ class IngestTaskManager:
                     except Exception:
                         pass
 
-            # 文件名查重：覆盖旧文件
+            # 文件名查重：版本化覆盖（旧版本保留记录/chunks，标记失效供回滚）
             existing_name = await store.afind_document_by_filename(filename)
+            old_version = 1
+            prev_doc_id = None
             if existing_name is not None:
                 try:
-                    await store.adelete_document(existing_name["id"], delete_storage=True)
+                    await store.areplace_document_for_new_version(existing_name["id"])
+                    old_version = await store._aget_document_version(existing_name["id"])
+                    prev_doc_id = existing_name["id"]
                 except Exception:
                     pass
 
@@ -238,6 +242,13 @@ class IngestTaskManager:
                         content_hash,
                         filename,
                     )
+
+                    # 版本化：若存在旧版本，为新文档设置版本号与版本链
+                    if prev_doc_id is not None:
+                        await conn.execute(
+                            "UPDATE documents SET version = $1, prev_doc_id = $2 WHERE id = $3",
+                            old_version + 1, prev_doc_id, doc_id,
+                        )
 
                     # 计算嵌入向量
                     texts = [d["page_content"] for d in chunked_docs]

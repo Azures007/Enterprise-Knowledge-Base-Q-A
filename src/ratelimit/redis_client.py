@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from threading import Lock
 from typing import Any, Optional
 
+from src.monitoring import record_redis_degraded, record_rate_limit_degraded
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -100,6 +101,8 @@ def get_redis():
     except Exception as e:
         _redis_available = False
         _redis_client = None
+        record_redis_degraded(f"Redis 连接失败: {e}")
+        record_rate_limit_degraded("Redis 不可用，限流降级为内存模式")
         logger.warning(f"Redis 不可用，使用内存限流: {e}")
         return None
 

@@ -1366,13 +1366,16 @@ async def ingest_document(
             existing_name = None
 
         if existing_name is not None:
-            logger.info(f"文件名 '{final_filename}' 已存在，执行覆盖更新 (旧文档 id={existing_name['id']})")
+            logger.info(f"文件名 '{final_filename}' 已存在，执行版本化覆盖 (旧文档 id={existing_name['id']})")
             old_doc_id = existing_name["id"]
+            old_version = 1
             try:
-                await rag.vector_store.adelete_document(old_doc_id, delete_storage=True)
-                logger.info(f"旧文档已删除 (id={old_doc_id})")
+                # 标记旧版本失效（保留记录/chunks/存储文件，供版本回滚）
+                await rag.vector_store.areplace_document_for_new_version(old_doc_id)
+                old_version = await rag.vector_store._aget_document_version(old_doc_id)
+                logger.info(f"旧文档已标记失效 (id={old_doc_id}, version={old_version})")
             except Exception as e:
-                logger.warning(f"删除旧文档失败（继续导入）: {e}")
+                logger.warning(f"标记旧文档失效失败（继续导入）: {e}")
             from src.cache import qa_cache
             qa_cache.invalidate_by_tags([f"doc:{final_filename}"])
             logger.info(f"已清除旧文档缓存: {final_filename}")
@@ -1415,6 +1418,18 @@ async def ingest_document(
                 storage_path=storage_path,
                 storage_backend=settings.STORAGE_BACKEND,
             )
+            # 版本化：若存在旧版本，为新文档设置版本号与版本链
+            if existing_name is not None and doc_id:
+                try:
+                    prev_id = existing_name["id"]
+                    await rag.vector_store._amark_document_version(
+                        doc_id, old_version + 1, prev_id,
+                    )
+                    logger.info(
+                        f"新版本已记录: '{final_filename}' v{old_version + 1} (doc_id={doc_id})"
+                    )
+                except Exception as e:
+                    logger.warning(f"设置文档版本号失败（不影响导入）: {e}")
         except Exception as e:
             logger.warning(f"记录文件元数据失败（不影响解析）: {e}")
             doc_id = None
@@ -1682,6 +1697,74 @@ async def delete_document(
     except Exception as e:
         logger.error(f"删除文档异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"删除文档失败: {e}")
+
+
+# ---------------------------------------------------------------
+# 文档版本管理（重传同名文件时保留历史版本，支持回滚）
+# ---------------------------------------------------------------
+
+async def _assert_doc_visible(rag, auth, doc_id: int) -> dict:
+    """校验文档存在且集合对当前用户可见，返回文档信息。"""
+    doc = await rag.vector_store.afind_document_by_id(doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    visible = await _visible_collections_for(rag, auth)
+    doc_collection = doc.get("collection_name")
+    if not is_admin_user(auth) and doc_collection not in visible:
+        raise HTTPException(status_code=403, detail="无权访问该文档")
+    return doc
+
+
+@router.get("/documents/{doc_id}/versions", summary="查看文档版本历史")
+async def get_document_versions(
+    doc_id: int,
+    rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
+):
+    """获取文档的完整版本链（按版本号降序，标记当前生效版本）。"""
+    try:
+        await _assert_doc_visible(rag, auth, doc_id)
+        versions = await rag.vector_store.alist_document_versions(doc_id)
+        return {"code": 0, "message": "success", "data": {"versions": versions}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取文档版本异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取文档版本失败: {e}")
+
+
+@router.post("/documents/{doc_id}/rollback", summary="回滚文档到指定版本")
+async def rollback_document(
+    doc_id: int,
+    rag: RAGPipeline = Depends(get_rag_pipeline),
+    auth: dict = Depends(require_auth),
+):
+    """
+    回滚到指定版本：将该版本标记为当前生效，旧版本失效。
+
+    回滚后该版本的内容立即参与检索（其 chunks 恢复可见）。
+    """
+    try:
+        await _assert_doc_visible(rag, auth, doc_id)
+        result = await rag.vector_store.arollback_document(doc_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="文档不存在")
+
+        # 失效相关缓存
+        from src.cache import qa_cache
+        qa_cache.invalidate_by_tags([f"doc:{result['filename']}"])
+        try:
+            await rag.vector_store.amark_stale_by_filenames([result["filename"]])
+        except Exception as e:
+            logger.warning(f"标记历史回答过期失败: {e}")
+
+        logger.info(f"文档回滚: '{result['filename']}' → v{result['version']}")
+        return {"code": 0, "message": "success", "data": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"回滚文档异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"回滚文档失败: {e}")
 
 
 # ---------------------------------------------------------------

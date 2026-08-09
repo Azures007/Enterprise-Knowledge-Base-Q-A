@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Any, Optional
 
 from config.settings import settings
+from src.monitoring import record_redis_degraded
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -125,6 +126,7 @@ class QACache:
         except Exception as e:
             self._redis_available = False
             self._redis = None
+            record_redis_degraded(f"问答缓存 Redis 不可用: {e}")
             logger.info(f"问答缓存: Redis 不可用，使用内存缓存 ({e})")
 
     def _make_key(self, question: str) -> str:
