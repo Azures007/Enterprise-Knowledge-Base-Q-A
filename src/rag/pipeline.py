@@ -24,6 +24,7 @@ RAG 检索增强生成管线（混合模式）
     print(result["answer_type"])  # "kb" | "general" | "hybrid"
 """
 
+import json
 from typing import Any
 
 from config.settings import settings
@@ -40,6 +41,7 @@ SCORE_THRESHOLD = 0.35
 
 # 问答缓存
 from src.cache import qa_cache
+from src.tracing import begin_trace, end_trace, get_tracer
 
 
 def _safe_json_loads(content: str):
@@ -360,11 +362,17 @@ class RAGPipeline:
         self._total_queries += 1
         logger.info(f"收到问题: {question[:120]}")
 
+        # ---- 链路追踪：创建 tracer 记录各层输入输出 ----
+        tracer = begin_trace(question)
+        tracer.log("input", output={"question": question, "history": history, "k": k})
+
         # ---- 第 0 步：检查缓存（仅无对话历史时使用缓存） ----
         if not stream and not history:
             cached = qa_cache.get(question)
             if cached is not None:
                 logger.info(f"缓存命中: {question[:80]}...")
+                tracer.log("cache_hit", input={"question": question})
+                end_trace()
                 return {
                     "answer": cached["answer"],
                     "sources": cached.get("sources", []),
@@ -381,6 +389,7 @@ class RAGPipeline:
             rewritten_question = self._rewrite_question(question, history)
             if rewritten_question and rewritten_question != question:
                 logger.info(f"问题重写: '{question[:50]}' → '{rewritten_question[:60]}'")
+        tracer.log("rewrite", input={"question": question, "history": history}, output={"rewritten_question": rewritten_question})
 
         # ---- 第 1~2 步：检索 + 组装提示 ----
         prepared = self._prepare_query(
@@ -389,6 +398,17 @@ class RAGPipeline:
             concise=concise,
             filter_criteria=filter_criteria,
         )
+        # 记录检索与提示词组装结果
+        tracer.log(
+            "retrieval",
+            input={"question": rewritten_question, "k": k},
+            output={
+                "answer_type": prepared["answer_type"],
+                "sources": prepared["sources"],
+                "retrieved_docs": prepared["retrieved_docs"],
+            },
+        )
+        tracer.log("prompt", input={"system_prompt": prepared["system_prompt"]})
 
         # ---- 第 3 步：LLM 生成 ----
         logger.info(f"正在生成回答（模式: {prepared['answer_type']}）...")
@@ -419,6 +439,12 @@ class RAGPipeline:
                 logger.info(
                     f"回答生成完成（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
                 )
+                tracer.log("generation", output={
+                    "answer": answer,
+                    "answer_type": prepared["answer_type"],
+                })
+                tracer.set_answer_type(prepared["answer_type"])
+                end_trace()
                 # 生成相关问题推荐（基于检索到的知识库文档）
                 related = []
                 if prepared["retrieved_docs"] and getattr(settings, "RELATED_QUESTIONS_ENABLED", True):
@@ -473,11 +499,17 @@ class RAGPipeline:
         self._total_queries += 1
         logger.info(f"收到问题(异步): {question[:120]}")
 
+        # ---- 链路追踪：创建 tracer 记录各层输入输出 ----
+        tracer = begin_trace(question)
+        tracer.log("input", output={"question": question, "history": history, "k": k})
+
         # ---- 第 0 步：检查缓存（仅无对话历史时使用缓存） ----
         if not stream and not history:
             cached = qa_cache.get(question)
             if cached is not None:
                 logger.info(f"缓存命中: {question[:80]}...")
+                tracer.log("cache_hit", input={"question": question})
+                end_trace()
                 return {
                     "answer": cached["answer"],
                     "sources": cached.get("sources", []),
@@ -494,6 +526,7 @@ class RAGPipeline:
             rewritten_question = await self._arewrite_question(question, history)
             if rewritten_question and rewritten_question != question:
                 logger.info(f"问题重写: '{question[:50]}' → '{rewritten_question[:60]}'")
+        tracer.log("rewrite", input={"question": question, "history": history}, output={"rewritten_question": rewritten_question})
 
         # ---- 第 0.75 步：工具调用模式（Agentic 检索） ----
         # 开关启用且有执行器时走工具模式；跨集合预检索(prefetched_docs)时不走，
@@ -505,6 +538,7 @@ class RAGPipeline:
             and getattr(settings, "TOOL_CALLING_ENABLED", False)
         ):
             logger.info(f"走工具调用模式: {question[:80]}")
+            tracer.log("tool_mode", input={"question": rewritten_question, "enabled": True})
             try:
                 tool_result = await self._atool_call_query(
                     question=rewritten_question,
@@ -513,6 +547,14 @@ class RAGPipeline:
                     history=history,
                     is_admin=False,
                 )
+                tracer.log("tool_result", output={
+                    "answer_type": tool_result["answer_type"],
+                    "sources": tool_result["sources"],
+                    "tool_calls": tool_result.get("tool_calls", []),
+                    "answer": tool_result["answer"],
+                })
+                tracer.set_answer_type(tool_result["answer_type"])
+                end_trace()
                 # 缓存（非流式、无历史）
                 if not history:
                     cache_tags = [
@@ -536,6 +578,17 @@ class RAGPipeline:
             filter_criteria=filter_criteria,
             prefetched_docs=prefetched_docs,
         )
+        # 记录检索与提示词组装结果
+        tracer.log(
+            "retrieval",
+            input={"question": rewritten_question, "k": k},
+            output={
+                "answer_type": prepared["answer_type"],
+                "sources": prepared["sources"],
+                "retrieved_docs": prepared["retrieved_docs"],
+            },
+        )
+        tracer.log("prompt", input={"system_prompt": prepared["system_prompt"]})
 
         # ---- 第 3 步：LLM 生成（异步） ----
         logger.info(f"正在生成回答(异步)（模式: {prepared['answer_type']}）...")
@@ -566,6 +619,12 @@ class RAGPipeline:
                 logger.info(
                     f"回答生成完成(异步)（模式: {prepared['answer_type']}, 长度={len(answer)}字）"
                 )
+                tracer.log("generation", output={
+                    "answer": answer,
+                    "answer_type": prepared["answer_type"],
+                })
+                tracer.set_answer_type(prepared["answer_type"])
+                end_trace()
                 # 生成相关问题推荐（基于检索到的知识库文档）
                 related = []
                 if prepared["retrieved_docs"] and getattr(settings, "RELATED_QUESTIONS_ENABLED", True):
@@ -635,6 +694,9 @@ class RAGPipeline:
             and getattr(settings, "TOOL_CALLING_ENABLED", False)
         ):
             try:
+                # 流式工具分支不经过 aquery，需在此创建 tracer
+                tracer = begin_trace(question)
+                tracer.log("input", output={"question": question, "history": history, "k": k})
                 tool_result = await self._atool_call_query(
                     question=question,
                     k=k,
@@ -643,6 +705,9 @@ class RAGPipeline:
                     is_admin=False,
                 )
                 content = tool_result["answer"]
+                tracer.log("generation", output={"answer": content, "answer_type": tool_result["answer_type"]})
+                tracer.set_answer_type(tool_result["answer_type"])
+                end_trace()
 
                 async def tool_stream():
                     # 分段产出最终回答（模拟流式；工具循环本身已非流式完成）
@@ -660,6 +725,7 @@ class RAGPipeline:
                     "tool_calls": tool_result.get("tool_calls", []),
                 }
             except Exception as e:
+                end_trace()  # 清理 tracer，避免 contextvar 泄漏
                 logger.warning(f"工具调用模式失败(流式)，退回标准检索: {e}")
 
         return await self.aquery(
@@ -729,6 +795,47 @@ class RAGPipeline:
             "reranker": self.reranker,
             "default_k": k or settings.RETRIEVAL_TOP_K,
         }
+
+        # ---- 强制预检索：进入工具循环前先无条件检索知识库 ----
+        # 避免 LLM 误判"知识库没有相关文档"而跳过 search_knowledge_base，
+        # 导致库里明明有内容却漏检（如"暑假计划"这类被 LLM 当作个人事务的问题）。
+        # 检索结果以 tool 消息注入，LLM 回答时可据此标注来源 [N]。
+        force_search = getattr(settings, "TOOL_FORCE_SEARCH", True)
+        if force_search:
+            try:
+                from src.tools.tools import run_tools
+
+                search_args = {"question": question, "k": k or settings.RETRIEVAL_TOP_K}
+                search_result = await run_tools(
+                    ctx, "search_knowledge_base", search_args
+                )
+                has_results = bool(
+                    search_result.get("results") or search_result.get("sources")
+                )
+                # 记录强制预检索结果（供链路排查）
+                tracer = get_tracer()
+                if tracer is not None:
+                    tracer.log(
+                        "force_search",
+                        input={"question": question, "k": search_args["k"]},
+                        output={
+                            "has_results": has_results,
+                            "results": search_result.get("results") or search_result.get("sources", []),
+                        },
+                    )
+                # 仅当确实检索到内容时才注入 tool 消息（空结果不误导 LLM 说"已检索过"）
+                if has_results:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": "force_search",
+                        "name": "search_knowledge_base",
+                        "content": json.dumps(search_result, ensure_ascii=False),
+                    })
+                    logger.info(
+                        f"强制预检索注入 {len(search_result.get('results', []))} 个文档块"
+                    )
+            except Exception as e:
+                logger.warning(f"强制预检索失败（不影响工具循环）: {e}")
 
         result = await self.tool_executor.run(
             messages, ctx, tools=None, is_admin=is_admin

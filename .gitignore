@@ -32,6 +32,7 @@ data/chroma_db/*
 
 # Logs
 logs/*.log
+logs/traces/
 !logs/.gitkeep
 
 # OS

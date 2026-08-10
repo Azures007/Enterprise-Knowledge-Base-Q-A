@@ -1,10 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import MessageBubble from './MessageBubble'
 import { streamQuery } from '../services/api'
-import {
-  addConversationMessage,
-  updateMessageContent,
-} from '../services/api'
 
 export default function ChatArea({
   messages,
@@ -23,8 +19,6 @@ export default function ChatArea({
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const abortRef = useRef(null)
-  const savedUserMsgId = useRef(null)
-  const savedAiMsgId = useRef(null)
 
   // 自动滚动到底部
   useEffect(() => {
@@ -55,21 +49,8 @@ export default function ChatArea({
 
     setInput('')
     setLoading(true)
-    savedAiMsgId.current = null
 
-    // 保存用户消息到后端
-    if (currentConvId) {
-      try {
-        const res = await addConversationMessage(currentConvId, {
-          role: 'user',
-          content: question,
-        })
-        savedUserMsgId.current = res.data?.id
-        onConversationUpdated?.()
-      } catch (err) {
-        console.warn('保存用户消息失败:', err.message)
-      }
-    }
+    // 用户消息由后端 stream 接口持久化（conversation_id），前端不再单独保存
 
     // 添加用户消息到本地
     addMessage({ role: 'user', content: question })
@@ -88,7 +69,13 @@ export default function ChatArea({
     let finalAnswerType = 'general'
 
     streamQuery(
-      { question, k: 5, concise: false, collection: selectedCollection },
+      {
+        question,
+        k: 5,
+        concise: false,
+        collection: selectedCollection,
+        conversation_id: currentConvId,
+      },
       {
         onChunk: (chunk) => {
           fullAnswer += chunk
@@ -110,6 +97,12 @@ export default function ChatArea({
             answer_type: meta.answer_type || prev.answer_type,
           }))
         },
+        onPersisted: (data) => {
+          // 后端已持久化该轮消息：回填 AI 消息 id，供反馈按钮关联
+          if (data?.ai_msg_id) {
+            updateLastMessage((prev) => ({ ...prev, id: data.ai_msg_id }))
+          }
+        },
         onDone: async (finalAnswer) => {
           const text = finalAnswer || fullAnswer
           updateLastMessage((prev) => ({
@@ -121,26 +114,8 @@ export default function ChatArea({
           }))
           setLoading(false)
 
-          // 保存 AI 消息到后端
-          if (currentConvId) {
-            try {
-              const res = await addConversationMessage(currentConvId, {
-                role: 'ai',
-                content: text,
-                sources: finalSources,
-                answer_type: finalAnswerType,
-              })
-              savedAiMsgId.current = res.data?.id
-              // 把后端返回的消息 id 补进本地消息，供反馈按钮关联
-              if (res.data?.id) {
-                updateLastMessage((prev) => ({ ...prev, id: res.data.id }))
-              }
-            } catch (err) {
-              console.warn('保存 AI 消息失败:', err.message)
-            }
-          }
-
-          // 刷新对话列表（更新消息数）
+          // AI 消息由后端 stream 接口持久化并回传 id（onPersisted 里回填）
+          // 此处仅刷新对话列表（更新消息数）
           onConversationUpdated?.()
         },
         onError: (errMsg) => {
@@ -159,15 +134,6 @@ export default function ChatArea({
             streaming: false,
           }))
           setLoading(false)
-          // 保存已收到的部分内容到对话历史
-          if (currentConvId && fullAnswer) {
-            addConversationMessage(currentConvId, {
-              role: 'ai',
-              content: fullAnswer + '\n\n--- 用户已停止输出 ---',
-              sources: finalSources,
-              answer_type: finalAnswerType,
-            }).catch(() => {})
-          }
           onConversationUpdated?.()
         },
       },

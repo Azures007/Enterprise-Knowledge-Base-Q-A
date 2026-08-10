@@ -136,11 +136,12 @@ export async function queryKB({ question, k = 5, concise = false }) {
  * 知识库问答（流式 SSE）
  * 返回 EventSource 实例，外部通过 onmessage 处理回调
  */
-export function streamQuery({ question, k = 5, concise = false, collection = null }, callbacks, signal) {
-  const { onChunk, onSources, onMeta, onDone, onError, onAbort } = callbacks
+export function streamQuery({ question, k = 5, concise = false, collection = null, conversation_id = null }, callbacks, signal) {
+  const { onChunk, onSources, onMeta, onPersisted, onDone, onError, onAbort } = callbacks
 
   const body = { question, k, concise }
   if (collection) body.collection = collection
+  if (conversation_id) body.conversation_id = conversation_id
 
   // 自动附带 token
   const headers = { 'Content-Type': 'application/json' }
@@ -201,6 +202,10 @@ export function streamQuery({ question, k = 5, concise = false, collection = nul
               case 'sources':
                 // 兼容旧格式
                 onSources?.(data.data)
+                break
+              case 'persisted':
+                // 该轮消息已持久化：回传 AI 消息 id，供反馈等后续操作关联
+                onPersisted?.(data.data)
                 break
               case 'done':
                 onDone?.(data.data)
@@ -636,6 +641,26 @@ export async function getAuditQueries(params) {
  */
 export async function getAuditSummary() {
   return request('/audit/summary')
+}
+
+/**
+ * 查询链路追踪列表（管理员），params: { limit, offset }
+ */
+export async function getTraces(params) {
+  const qs = new URLSearchParams()
+  if (params) {
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, v)
+    })
+  }
+  return request(`/traces?${qs.toString()}`)
+}
+
+/**
+ * 查询链路追踪详情（管理员）
+ */
+export async function getTraceDetail(traceId) {
+  return request(`/traces/${encodeURIComponent(traceId)}`)
 }
 
 /**

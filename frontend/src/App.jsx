@@ -5,6 +5,7 @@ import LoginPage from './components/LoginPage'
 import UserManagementModal from './components/UserManagementModal'
 import ChangePasswordModal from './components/ChangePasswordModal'
 import AuditModal from './components/AuditModal'
+import TraceModal from './components/TraceModal'
 import {
   checkHealth,
   getCollections,
@@ -23,6 +24,7 @@ export default function App() {
   const [showUserModal, setShowUserModal] = useState(false)
   const [showPwdModal, setShowPwdModal] = useState(false)
   const [showAuditModal, setShowAuditModal] = useState(false)
+  const [showTraceModal, setShowTraceModal] = useState(false)
 
   // 知识库
   const [collections, setCollections] = useState([])
@@ -231,6 +233,11 @@ export default function App() {
               📊 审计
             </button>
           )}
+          {isAdmin() && (
+            <button className="logout-button" onClick={() => setShowTraceModal(true)} title="链路追踪">
+              🔍 追踪
+            </button>
+          )}
           <button className="logout-button" onClick={() => setShowPwdModal(true)} title="修改密码">
             🔑 改密码
           </button>
@@ -250,6 +257,10 @@ export default function App() {
 
       {showAuditModal && (
         <AuditModal onClose={() => setShowAuditModal(false)} />
+      )}
+
+      {showTraceModal && (
+        <TraceModal onClose={() => setShowTraceModal(false)} />
       )}
 
       <div className="app-body">

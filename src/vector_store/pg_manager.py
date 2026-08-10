@@ -1731,6 +1731,13 @@ class PGVectorStore:
                 )
             ) > 0
 
+    async def aget_conversation_owner(self, conv_id: int) -> int | None:
+        """获取对话归属用户 ID（None 表示匿名/不存在）。"""
+        async with (await self._aconn()).acquire() as conn:
+            return await conn.fetchval(
+                "SELECT user_id FROM conversations WHERE id = $1", conv_id
+            )
+
     async def aget_conversation_messages(self, conv_id: int, user_id: int | None = None) -> list[dict[str, Any]]:
         """获取对话的消息列表（指定 user_id 时仅能读自己的对话）。"""
         async with (await self._aconn()).acquire() as conn:

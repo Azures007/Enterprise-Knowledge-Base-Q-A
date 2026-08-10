@@ -48,6 +48,7 @@ from config.settings import settings
 
 from src.conversations import ConversationManager, PGConversationManager
 from src.auth import create_token, require_auth
+from src.tracing import get_tracer, end_trace
 from src.user_scope import user_personal_collection, is_admin_user, visible_collections
 
 from .models import (
@@ -115,6 +116,25 @@ async def _resolve_user_id(mgr: PGConversationManager, auth: dict) -> int | None
         return await mgr.aget_user_id(username)
     except Exception:
         return None
+
+
+async def _can_write_conversation(mgr, conversation_id, user_id) -> bool:
+    """
+    判断当前用户是否有权向该对话写入消息。
+
+    - 匿名共享（user_id 为 None）→ 允许
+    - 对话归属当前用户 → 允许
+    - 其他 → 拒绝（防止越权写入他人对话）
+    """
+    if user_id is None:
+        return True
+    if conversation_id is None:
+        return False
+    try:
+        owned = await mgr.aget_conversation_owner(conversation_id)
+    except Exception:
+        return False
+    return owned is not None and owned == user_id
 
 
 # 多轮对话历史 token 预算（字符估算，约为 token 数 × 2）
@@ -620,17 +640,14 @@ async def query_knowledge_base(
             sources = [SourceInfo(**s) for s in result["sources"]]
 
             # ---- 持久化对话（如传入 conversation_id） ----
-            if conversation_id is not None:
+            if conversation_id is not None and await _can_write_conversation(mgr, conversation_id, user_id):
                 try:
-                    # 仅在用户有权限（对话归属当前用户或匿名共享）时写入
-                    owned_msgs = await mgr.aget_messages(conversation_id, user_id=user_id)
-                    if owned_msgs or user_id is None:
-                        await mgr.aadd_message(conversation_id, "user", question)
-                        await mgr.aadd_message(
-                            conversation_id, "ai", answer,
-                            sources=[s.model_dump() for s in sources],
-                            answer_type=result.get("answer_type", "general"),
-                        )
+                    await mgr.aadd_message(conversation_id, "user", question)
+                    await mgr.aadd_message(
+                        conversation_id, "ai", answer,
+                        sources=[s.model_dump() for s in sources],
+                        answer_type=result.get("answer_type", "general"),
+                    )
                 except Exception as e:
                     logger.warning(f"持久化对话失败: {e}")
 
@@ -728,8 +745,8 @@ async def query_knowledge_base(
         answer = result["answer"]
         sources = [SourceInfo(**s) for s in result["sources"]]
 
-        # ---- 持久化对话（如传入 conversation_id） ----
-        if conversation_id is not None:
+        # ---- 持久化对话（如传入 conversation_id，仅在有权限时写入） ----
+        if conversation_id is not None and await _can_write_conversation(mgr, conversation_id, user_id):
             try:
                 await mgr.aadd_message(conversation_id, "user", question)
                 await mgr.aadd_message(
@@ -842,6 +859,13 @@ async def query_knowledge_base_stream(
         async def empty_kb_generator():
             """知识库为空时的 SSE 生成器：LLM 通用知识回答 + 上传提示"""
             try:
+                # 持久化用户消息（流式开始前写入，即使中断也不丢用户提问）
+                if conversation_id is not None and await _can_write_conversation(mgr, conversation_id, user_id):
+                    try:
+                        await mgr.aadd_message(conversation_id, "user", question)
+                    except Exception as e:
+                        logger.warning(f"持久化用户消息失败: {e}")
+
                 result = await rag.astream_query(
                     question=question,
                     k=k,
@@ -862,19 +886,26 @@ async def query_knowledge_base_stream(
 
                 yield f"data: {json.dumps({'type': 'done', 'data': full_answer}, ensure_ascii=False)}\n\n"
 
-                # 持久化对话（如传入 conversation_id，仅在有权访问时写入）
-                if conversation_id is not None:
+                # 记录流式回答并结束链路追踪
+                tracer = get_tracer()
+                if tracer is not None:
+                    tracer.log("generation", output={"answer": full_answer, "answer_type": answer_type})
+                    tracer.set_answer_type(answer_type)
+                    end_trace()
+
+                # 持久化 AI 消息并回传消息 id（仅在有权限访问时写入）
+                ai_msg_id = None
+                if conversation_id is not None and await _can_write_conversation(mgr, conversation_id, user_id):
                     try:
-                        owned_msgs = await mgr.aget_messages(conversation_id, user_id=user_id)
-                        if owned_msgs or user_id is None:
-                            await mgr.aadd_message(conversation_id, "user", question)
-                            await mgr.aadd_message(
-                                conversation_id, "ai", full_answer,
-                                sources=sources,
-                                answer_type=answer_type,
-                            )
+                        ai_msg_id = await mgr.aadd_message(
+                            conversation_id, "ai", full_answer,
+                            sources=sources,
+                            answer_type=answer_type,
+                        )
                     except Exception as e:
-                        logger.warning(f"持久化对话失败: {e}")
+                        logger.warning(f"持久化 AI 消息失败: {e}")
+
+                yield f"data: {json.dumps({'type': 'persisted', 'data': {'ai_msg_id': ai_msg_id, 'conversation_id': conversation_id}}, ensure_ascii=False)}\n\n"
 
                 # ---- 查询审计（流式空知识库分支） ----
                 try:
@@ -942,6 +973,14 @@ async def query_knowledge_base_stream(
                 getattr(settings, "TOOL_CALLING_ENABLED", False)
                 and getattr(rag, "tool_executor", None) is not None
             )
+            # ---- 持久化用户消息（流式开始前写入，即使中断也不丢用户提问） ----
+            # 仅在有权访问对话时写入（对话归属当前用户或匿名共享）
+            if conversation_id is not None and await _can_write_conversation(mgr, conversation_id, user_id):
+                try:
+                    await mgr.aadd_message(conversation_id, "user", question)
+                except Exception as e:
+                    logger.warning(f"持久化用户消息失败: {e}")
+
             result = await rag.astream_query(
                 question=question,
                 k=k,
@@ -966,19 +1005,27 @@ async def query_knowledge_base_stream(
             # 发送完成信号
             yield f"data: {json.dumps({'type': 'done', 'data': full_answer}, ensure_ascii=False)}\n\n"
 
-            # ---- 持久化对话（如传入 conversation_id，仅在有权访问时写入） ----
-            if conversation_id is not None:
+            # 记录流式回答并结束链路追踪
+            tracer = get_tracer()
+            if tracer is not None:
+                tracer.log("generation", output={"answer": full_answer, "answer_type": answer_type})
+                tracer.set_answer_type(answer_type)
+                end_trace()
+
+            # ---- 持久化 AI 消息（流式结束后）并回传消息 id 供前端关联反馈 ----
+            ai_msg_id = None
+            if conversation_id is not None and await _can_write_conversation(mgr, conversation_id, user_id):
                 try:
-                    owned_msgs = await mgr.aget_messages(conversation_id, user_id=user_id)
-                    if owned_msgs or user_id is None:
-                        await mgr.aadd_message(conversation_id, "user", question)
-                        await mgr.aadd_message(
-                            conversation_id, "ai", full_answer,
-                            sources=sources,
-                            answer_type=answer_type,
-                        )
+                    ai_msg_id = await mgr.aadd_message(
+                        conversation_id, "ai", full_answer,
+                        sources=sources,
+                        answer_type=answer_type,
+                    )
                 except Exception as e:
-                    logger.warning(f"持久化对话失败: {e}")
+                    logger.warning(f"持久化 AI 消息失败: {e}")
+
+            # 通知前端该轮消息已持久化（含 AI 消息 id，用于反馈等后续操作）
+            yield f"data: {json.dumps({'type': 'persisted', 'data': {'ai_msg_id': ai_msg_id, 'conversation_id': conversation_id}}, ensure_ascii=False)}\n\n"
 
             # ---- 查询审计（流式正常分支） ----
             try:
@@ -2181,6 +2228,49 @@ async def list_query_audit(
     except Exception as e:
         logger.error(f"查询审计失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"查询审计失败: {e}")
+
+
+# ---------------------------------------------------------------
+# 查询链路追踪（管理员）
+# ---------------------------------------------------------------
+
+@router.get("/traces", summary="查询链路追踪列表（管理员）")
+async def list_traces(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    auth: dict = Depends(require_auth),
+):
+    """分页返回最近一次问答的链路追踪摘要（实时，按时间倒序）。"""
+    await _require_admin(request, auth)
+    try:
+        from src.tracing import list_traces as _list_traces
+        rows = _list_traces(limit=min(limit, 100), offset=max(offset, 0))
+        return {"code": 0, "message": "success", "data": rows}
+    except Exception as e:
+        logger.error(f"查询链路追踪失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询链路追踪失败: {e}")
+
+
+@router.get("/traces/{trace_id}", summary="查询链路追踪详情（管理员）")
+async def get_trace_detail(
+    trace_id: str,
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
+    """按 trace_id 返回完整链路（各环节输入/输出）。"""
+    await _require_admin(request, auth)
+    try:
+        from src.tracing import get_trace as _get_trace
+        data = _get_trace(trace_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="追踪记录不存在")
+        return {"code": 0, "message": "success", "data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询链路追踪详情失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询链路追踪详情失败: {e}")
 
 
 @router.get("/audit/summary", summary="查询审计汇总（管理员）")

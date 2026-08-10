@@ -323,6 +323,10 @@ class PGConversationManager:
     async def aget_messages(self, conv_id: int, user_id: int | None = None) -> list[dict]:
         return await self._store.aget_conversation_messages(conv_id, user_id=user_id)
 
+    async def aget_conversation_owner(self, conv_id: int) -> int | None:
+        """获取对话归属用户 ID（用于写权限校验）。"""
+        return await self._store.aget_conversation_owner(conv_id)
+
     async def aadd_message(self, conv_id: int, role: str, content: str,
                            sources=None, answer_type=None) -> int:
         return await self._store.aadd_message(conv_id, role, content, sources, answer_type)

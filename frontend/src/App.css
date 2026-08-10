@@ -2121,6 +2121,11 @@ body {
 .audit-modal {
   width: 820px;
   max-width: 94vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
 }
 
 .audit-cards {
@@ -2333,4 +2338,176 @@ body {
 .audit-expand-error {
   font-size: 12px;
   color: var(--color-danger);
+}
+
+/* =============================================================================
+   查询链路追踪弹窗
+   ============================================================================= */
+.trace-modal {
+  width: 860px;
+  max-width: 94vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trace-item {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.trace-item:hover {
+  background: var(--color-primary-bg);
+  border-color: var(--color-primary);
+}
+
+.trace-item-q {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.trace-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.trace-badge.kb { background: rgba(37, 99, 235, 0.12); color: var(--color-primary); }
+.trace-badge.hybrid { background: rgba(217, 119, 6, 0.12); color: var(--color-warning); }
+.trace-badge.general { background: rgba(5, 150, 105, 0.12); color: var(--color-success); }
+.trace-badge.tool { background: rgba(124, 58, 237, 0.12); color: var(--color-primary); }
+
+.trace-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--color-sidebar);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin: 10px 0;
+}
+
+.trace-detail-question {
+  font-weight: 600;
+  color: var(--color-text);
+  flex: 1;
+  min-width: 200px;
+}
+
+.trace-back-btn {
+  margin-bottom: 6px;
+}
+
+.trace-stages {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trace-stage {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.trace-stage-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--color-sidebar);
+  cursor: pointer;
+  user-select: none;
+}
+
+.trace-stage-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text);
+  flex: 1;
+}
+
+.trace-stage-time {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.trace-stage-toggle {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.trace-stage-body {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trace-stage-io {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.trace-io-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.trace-io-content {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 11px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  color: var(--color-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0;
+}
+
+.trace-stage-empty {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.trace-empty-hint {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin-top: 6px;
 }
